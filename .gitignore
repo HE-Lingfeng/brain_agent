@@ -1,0 +1,34 @@
+# Default-deny: this repository is for publishing brain_agent source only.
+*
+
+# Keep the safety rules visible in the repository.
+!.gitignore
+
+# Publish Python source for brain_agent.
+!brain_agent/
+!brain_agent/**/*.py
+
+# Always keep local/private material out of GitHub.
+.env
+.env.*
+*.pem
+*.key
+*.py[cod]
+__pycache__/
+*secret*
+*credential*
+*password*
+*token*
+*api_key*
+*apikey*
+*config.local*
+!brain_agent/credentials.py
+brain_agent/**/docs/
+brain_agent/**/documents/
+brain_agent/**/*.md
+brain_agent/**/*.pdf
+brain_agent/**/*.doc
+brain_agent/**/*.docx
+brain_agent/**/*.xls
+brain_agent/**/*.xlsx
+brain_agent/**/*.csv
