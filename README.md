@@ -1,12 +1,12 @@
 # brain_agent
 
-`brain_agent` is a local WorldQuant BRAIN alpha-mining orchestrator. It coordinates idea generation, inspection, simulation, enhancement, reporting, memory, and submission-readiness checks while keeping credentials outside the repository.
+`brain_agent` is a local WorldQuant BRAIN alpha-mining orchestrator. It coordinates idea generation, inspection, simulation, variant search, enhancement, reporting, memory, and submission-readiness checks while keeping credentials outside the repository.
+
+For Codex/Claude Code maintenance, start with `CODEX_CONTEXT.md` — a compact project map with current invariants, common commands, and the minimal set of files to inspect for common tasks.
 
 ## Repository Layout
 
 The Python package files live at the repository root. If this repository is cloned as `brain_agent`, run it from the parent directory:
-
-For Codex/Claude Code maintenance, start with `CODEX_CONTEXT.md`. It is a compact project map with current invariants, high-throughput features, common commands, and the smallest set of files to inspect for common tasks.
 
 ```bash
 python3 -m brain_agent --help
@@ -20,9 +20,9 @@ PYTHONPATH=.. python3 -m brain_agent --help
 
 ## Credentials
 
-Do not commit credentials to this repository. The agent reads credentials from environment variables or a local secret file.
+Do not commit credentials to this repository. The agent reads credentials with precedence: **provider defaults < secret file < environment variables**.
 
-Environment variables:
+### Environment Variables
 
 ```bash
 export BRAIN_EMAIL=<brain-email>
@@ -33,13 +33,9 @@ export LLM_BASE_URL=https://api.moonshot.cn/v1
 export LLM_MODEL=kimi-k2.5
 ```
 
-Optional local secret file path:
+### Secret File (optional)
 
-```text
-~/secrets/worldquant-brain.json
-```
-
-Expected shape:
+Path: `~/secrets/worldquant-brain.json`
 
 ```json
 {
@@ -56,90 +52,42 @@ Expected shape:
 }
 ```
 
-`provider` can be `moonshot`, `deepseek`, `openai`, or any OpenAI-compatible endpoint when `base_url` and `model` are set. Legacy `MOONSHOT_API_KEY`, `MOONSHOT_BASE_URL`, `MOONSHOT_MODEL`, and `moonshot_*` secret keys still work for older local scripts, but `LLM_*` and `llm.api_key/base_url/model` are preferred.
+Supported `provider` values: `moonshot`, `deepseek`, `openai`, or any OpenAI-compatible endpoint when `base_url` and `model` are set.
+
+Legacy `MOONSHOT_API_KEY`, `MOONSHOT_BASE_URL`, `MOONSHOT_MODEL`, and `moonshot_*` secret keys still work for older local scripts, but `LLM_*` env vars and `llm.*` secret keys are preferred.
 
 The repository `.gitignore` uses a default-deny policy so runtime data, documents, caches, and secret-like files stay local.
 
-## Basic Commands
+## Quick Start
+
+### Doctor Check
 
 ```bash
-PYTHONPATH=.. python3 -m brain_agent doctor --check-llm
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime doctor --check-llm
 ```
 
-List or choose reusable dataset/settings presets:
+### Settings Presets
+
+List or interactively choose reusable dataset/settings presets:
 
 ```bash
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime settings list
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime settings show --preset eur_top2500_slow_fast
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime settings choose --print-command
 ```
 
-```bash
-PYTHONPATH=.. python3 -m brain_agent run \
-  --dataset fundamental31 \
-  --preset eur_top2500_slow_fast \
-  --target-ready 1 \
-  --max-iterations 1 \
-  --max-sim-alphas 1 \
-  --max-variant-alphas 6 \
-  --max-variants-per-alpha 3
-```
+Built-in presets:
 
-```bash
-PYTHONPATH=.. python3 -m brain_agent report --run-id <run_id>
-```
+| Name | Region | Universe | Neutralization |
+|------|--------|----------|----------------|
+| `eur_top2500_slow_fast` | EUR | TOP2500 | SLOW_AND_FAST |
+| `usa_top3000_industry` | USA | TOP3000 | INDUSTRY |
+| `usa_top3000_subindustry` | USA | TOP3000 | SUBINDUSTRY |
+| `glb_top3000_market` | GLB | TOP3000 | MARKET |
 
-During real batch simulation, the foreground CLI prints a compact progress line like:
+All presets use `delay=1`, `data_type=MATRIX`, `decay=10`, `truncation=0.08`, `max_trade=false`. Built-in presets intentionally omit dataset ids because BRAIN datasets change over time; pass `--dataset` explicitly or use `--choose-settings` to enter it interactively.
 
-```text
-simulation: [########............] 8/20 (40.0%) | running=4 | slots=4x10 | capacity=40 | remaining=12 | completed=7 | failed=1
-```
-
-Simulation defaults are intentionally conservative to reduce BRAIN rate limits while still filling quota: non-GLB regions use `--concurrency 8 --batch-size 10` by default, while GLB uses `--concurrency 4 --batch-size 4`. You can still override them manually; the batch simulator clamps requests above the regional safety limits (`8x10` outside GLB, `4x10` for GLB). Batch polling now waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish, because BRAIN queueing during peak hours can otherwise look like a failed batch. Parent, child, and single-simulation status fetches use bounded retries for transient HTTP, JSON, or empty-response reads before recording a failure.
-
-You can also refresh the latest task and simulation snapshot:
-
-```bash
-PYTHONPATH=.. python3 -m brain_agent tasks --run-id <run_id> --refresh
-PYTHONPATH=.. python3 -m brain_agent status --run-id <run_id>
-```
-
-If a run contains retryable platform failures such as `TIMEOUT` or `BATCH_SPAWN_FAILED`, rebuild a clean retry list and resimulate only those candidates:
-
-```bash
-PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime retry-sim \
-  --run-id <run_id> \
-  --batch-size 10 \
-  --concurrency 8
-```
-
-Use `--dry-run` to write `alpha_list_retryable.json` without submitting.
-
-For non-interactive quota draining, run the worker against an existing run. By default each worker batch is capped to `batch_size * concurrency` candidates, and `--max-total-alphas` is enforced against the remaining quota before each batch starts:
-
-```bash
-PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
-  --run-id <run_id> \
-  --mode drain \
-  --max-total-alphas 5000
-```
-
-To inspect research quality across recent runs:
-
-```bash
-PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime research summary --limit 20
-```
-
-You can filter by dataset/region, specific run ids, switch to JSON, or write the report:
-
-```bash
-PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime research summary \
-  --dataset institutions6 \
-  --region USA \
-  --format markdown \
-  --output .brain_runtime/research_quality/institutions6_usa.md
-```
-
-`run` supports `--preset <name>` and `--choose-settings` so frequent BRAIN settings do not need to be typed every session. Built-in presets intentionally do not include dataset ids because BRAIN datasets change over time; pass `--dataset <dataset_id>` for scripted runs, or use `--choose-settings` and enter the dataset interactively. Explicit flags such as `--neutralization` or `--decay` override the preset. Add personal presets in `<runtime-root>/settings_presets.json` if you want to maintain your own fixed choices:
+Add personal presets in `<runtime-root>/settings_presets.json`:
 
 ```json
 {
@@ -162,24 +110,302 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime research summ
 }
 ```
 
-Alpha Memory keeps generated candidates separate from simulated learning evidence. Pattern scoring uses only simulated/promising/gate-passed samples, tracks confidence and recency, and separates non-success from hard-failure risk so weak but syntactically valid patterns do not get treated like parser or coverage failures. Use the summary to inspect the current layers and learned operator/field-family/factor-thesis signals:
+Explicit CLI flags (`--dataset`, `--neutralization`, `--decay`, etc.) override preset values.
+
+## Core Commands
+
+### Run
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime run \
+  --dataset fundamental31 \
+  --preset eur_top2500_slow_fast \
+  --target-ready 1 \
+  --max-iterations 1 \
+  --max-sim-alphas 1 \
+  --max-variant-alphas 6 \
+  --max-variants-per-alpha 3
+```
+
+Each run progresses through stages: **GENERATE → INSPECT → SIMULATE → VARIANT_SEARCH → DECIDE → ENHANCE → SUBMIT_GATE → REPORT**.
+
+Use `--dry-run` to validate the local pipeline without calling BRAIN or LLM APIs.
+
+### Resume
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime resume --run-id <run_id>
+```
+
+### Status
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime status --run-id <run_id>
+```
+
+### Tasks
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime tasks --run-id <run_id> --refresh
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime tasks --run-id <run_id> --task-id <task_id> --cancel
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime tasks --run-id <run_id> --task-id <task_id> --retry
+```
+
+### Report & Export
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime report --run-id <run_id>
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime export --run-id <run_id>
+```
+
+`report` writes `run_report.md` and `run_result.json`. `export` writes a full JSON dump of the run result.
+
+## Simulation & Quota
+
+### Simulation Progress
+
+During batch simulation, the foreground CLI prints a compact progress line:
+
+```text
+simulation: [########............] 8/20 (40.0%) | running=4 | slots=4x10 | capacity=40 | remaining=12 | completed=7 | failed=1
+```
+
+### Simulation Defaults
+
+Defaults are intentionally conservative to reduce BRAIN rate limits:
+
+| Region | Concurrency | Batch Size | Capacity |
+|--------|-------------|------------|----------|
+| Non-GLB | 8 | 10 | 80 |
+| GLB | 4 | 4 | 16 |
+
+Override with `--concurrency` and `--batch-size`. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish.
+
+### Retry Failed Simulations
+
+Rebuild a clean retry list from `TIMEOUT`, `BATCH_SPAWN_FAILED`, and other retryable platform failures:
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime retry-sim \
+  --run-id <run_id> \
+  --batch-size 10 \
+  --concurrency 8
+```
+
+Use `--dry-run` to write `alpha_list_retryable.json` without submitting.
+
+### Worker (Non-Interactive Drain)
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
+  --run-id <run_id> \
+  --mode drain \
+  --max-total-alphas 5000
+```
+
+Each batch is capped to `batch_size * concurrency` candidates by default. `--max-total-alphas` is enforced against the remaining quota before each batch starts. Use `--mode once` for a single batch.
+
+### Simulation Quota Allocator
+
+When `--max-sim-alphas` is set, the quota allocator splits scarce simulation budget across three strategies:
+
+- **Exploit**: memory-backed candidates with historically successful patterns.
+- **Explore**: new field families and low-evidence structures to avoid local loops.
+- **Repair**: candidates with clear `repair_objectives` and high repairability.
+
+The allocator also applies duplicate-cluster penalties and writes `alpha_list_quota_report` for review.
+
+## Variant Search
+
+After the initial simulation pass, the pipeline spends a small bounded budget on deterministic local variants of alphas with weak or repairable signal. Use `--max-variant-alphas 0` to disable.
+
+### Optimizer Modules
+
+Six named optimizer modules target specific failure modes:
+
+| Optimizer | Trigger |
+|-----------|---------|
+| `LowFitnessOptimizer` | Near-zero Sharpe/Fitness |
+| `LowTurnoverOptimizer` | Over-smoothed or over-filtered signals |
+| `HighTurnoverOptimizer` | Excessive turnover |
+| `ShortFlipOptimizer` | Inverse/negative signals |
+| `CoverageRepairer` | Coverage, subuniverse, or unavailable-field failures |
+| `CorrelationOptimizer` | Self/prod correlation failures (requires gate diagnostics) |
+
+Each optimizer generates multiple variants, preserves parent lineage, and reports original-vs-variant metric deltas in `run_report.md`.
+
+### Generic Variants
+
+The pipeline also generates close generic variants: window sweep, decay sweep, rank/zscore swap, neutralization/decay cross sweep, turnover-control wrappers, and coverage repair wrappers.
+
+### PnL Pruning
+
+Completed simulations best-effort populate `pnl_cache.json`. When present, variant search uses cached PnL series to prune highly correlated parents before generating variants.
+
+Variants are stored as candidates with lineage fields (`parent_candidate_id`, `variant_strategy`, `variant_params`, `lineage_json`) and simulated through the same batch pipeline as original alphas.
+
+## Alpha Memory
+
+Cross-run memory tracks dataset, field family, operator pattern, factor thesis, prompt version, and failure mode performance. It lives at `<runtime_root>/alpha_memory.sqlite3`.
+
+### Ingest
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime memory ingest --run-id <run_id>
+```
+
+Run reports auto-ingest on `write_report`. Only simulated/promising/gate-passed samples enter the learnable evidence pool; generated-but-untested candidates are tracked separately and do not pollute success-rate denominators.
+
+### Summary
 
 ```bash
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime memory summary --dataset institutions6 --region USA
 ```
 
-When `--max-sim-alphas` is set, batch simulation uses a quota allocator instead of taking the first N scored candidates. The allocator splits scarce quota across memory-backed exploitation, new-pattern exploration, and repairable failures, then writes `alpha_list_quota_report` under the run artifacts for review. The report includes selected/rejected candidate explanations, pattern confidence, historical success/failure adjustments, and duplicate-cluster penalties.
+The summary shows current layers: operators, field families, factor thesis types, expected failure modes, learned repair methods, and recent runs.
 
-The make/inspect path now attaches a `factor_thesis` object to every candidate. If the generator emits thesis fields, they are preserved; otherwise `brain_agent` infers a conservative thesis from the expression. Candidate rows store `thesis_json`, generated artifacts include `factor_theses`, memory learns `thesis_type`, expected failure modes, and intended repair methods, and reports show a Factor Thesis summary.
+### Scoring Integration
 
-Real inspect runs also add a small Field Factory alpha list from target datafield metadata. MATRIX fields are used directly, VECTOR fields are wrapped with `vec_avg(...)`, and low-coverage fields are backfilled before simple rank/mean/delta variants are emitted. The generated rows are recorded as `alpha_list_field_factory` and merged into `alpha_list_combined`.
+Candidate scoring reads memory to compute `memory_score` (historical success rate with recency decay) and `memory_risk_penalty` (hard failure tag history). Memory weights are intentionally small; when samples are scarce, behavior remains close to the no-memory baseline.
 
-Prompt A/B comparison is settings-aware. `prompt compare` only declares a direct winner when compared runs share the same dataset, region, delay, universe, data type, decay, truncation, neutralization, and max trade settings. The first `--run-id` is treated as the baseline; default prompt promotion is marked eligible only when valid rate, promising rate, average fitness, or hard-failure rate improves enough versus that baseline without hard-failure regression.
+## Prompt A/B Comparison
 
-Submit gate checks read the same platform-backed checks exposed on alpha detail pages. The primary path uses `/alphas/{id}/check`, then falls back to `/alphas/{id}` `is.checks` when the check endpoint returns no rows, and normalizes platform check names such as `CONCENTRATED_WEIGHT` and `LOW_SUB_UNIVERSE_SHARPE`. Correlation rows inside `/check` can remain `PENDING`, so submit readiness ignores those rows and uses the dedicated self/prod correlation endpoints instead. Gate checks are non-fatal when the BRAIN API, proxy, or correlation endpoints fail mid-check. These rows are stored as `gate_status=incomplete` with an `error_type` such as `network_error`; reports show a Gate Incomplete summary, and the run can still finish without turning transient gate evidence gaps into alpha quality failures.
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime prompt compare \
+  --run-id prompt_baseline \
+  --run-id prompt_experiment \
+  --format markdown \
+  --output .brain_runtime/prompt_ab/comparison.md
+```
 
-Run stability is defensive around common transient failures. Malformed LLM/legacy JSON artifacts are converted into structured adapter failures instead of raw tracebacks, unexpected controller errors are recorded on the run as `FAILED` with a report, and BRAIN datafield preflight API failures are stored as `datafields_preflight_incomplete` while batch simulation continues so per-alpha simulator evidence can still be collected.
+The first `--run-id` is treated as the baseline. Comparison is only valid when runs share the same dataset, region, delay, universe, data type, decay, truncation, neutralization, and max trade settings. A prompt is marked eligible for promotion only when it improves valid rate, promising rate, average fitness, or hard-failure rate versus the baseline without introducing hard-failure regression.
 
-After an initial simulation pass, local Variant Search can spend a small bounded budget on deterministic variants of alphas with weak or repairable signal. It now starts with named optimizer modules: `LowFitnessOptimizer` for near-zero Sharpe/Fitness, `LowTurnoverOptimizer` for over-smoothed or over-filtered alphas, `HighTurnoverOptimizer` for excessive turnover, `ShortFlipOptimizer` for inverse signals, `CoverageRepairer` for coverage/subuniverse/unavailable-field style failures, and `CorrelationOptimizer` for self/prod correlation failures when gate diagnostics are available. It then supplements them with close generic variants such as window sweep, decay sweep, rank/zscore swap, neutralization/decay cross sweep, turnover-control wrappers, and coverage repair wrappers. Completed simulations best-effort populate `pnl_cache.json`; when present, Variant Search uses the cached PnL series to prune highly correlated parents before generating variants. Variants are stored as normal candidates with lineage fields (`parent_candidate_id`, `variant_strategy`, `variant_params`, `lineage_json`), and `run_report.md` includes original-vs-variant deltas, variant-strategy effectiveness, quota-waste analysis, and next research recommendations after the current run has been ingested into memory.
+## Forum & Knowledge
 
-Use `--max-variant-alphas 0` to disable local variant search. `--max-variants-per-alpha` controls how many close variants can be generated for one parent alpha.
+### Forum Search & Learning
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime forum search "turnover" --max-results 10 --format markdown
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime forum read "<post-id-or-url>" --format markdown
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime forum learn "turnover submit fitness" \
+  --max-results 10 --read-top 3 --format markdown --output .brain_runtime/forum_learning/turnover.md
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime forum daily-learn --output-dir .brain_runtime/forum_learning
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime forum glossary --format markdown
+```
+
+### Knowledge Approval
+
+`forum learn` and `daily-learn` produce review reports only — they do not modify system behavior. To ingest approved lessons into the knowledge base:
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime knowledge approve-forum-lesson \
+  --report .brain_runtime/forum_learning/turnover.md \
+  --title "turnover reduction"
+```
+
+Approved lessons are injected into make/enhance prompts with compact summaries. The knowledge base lives at `brain_agent/knowledge/approved_forum_lessons/`.
+
+## Submit Gate
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime gate --run-id <run_id>
+```
+
+Gate checks read platform-backed checks (`/alphas/{id}/check`, falling back to `/alphas/{id}` `is.checks`), plus dedicated self/prod correlation endpoints. Gate failures from transient network/proxy errors are recorded as `gate_status=incomplete` rather than alpha quality failures.
+
+Use `--dry-run` for local deterministic mock checks.
+
+## Research Quality
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime research summary --limit 20
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime research summary \
+  --dataset institutions6 --region USA --format markdown \
+  --output .brain_runtime/research_quality/institutions6_usa.md
+```
+
+Reports aggregate the quality funnel (generated → simulated → complete → promising → submit-ready → gate-passed), failure tags, operator signals, field family signals, and recent run summaries with recommendations.
+
+## Artifact Import
+
+Import legacy artifacts from external or manual pipeline runs:
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime parse-artifact \
+  --run-id <run_id> --kind final_expressions --path <path/to/final_expressions.json>
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime parse-artifact \
+  --run-id <run_id> --kind alpha_list --path <path/to/alpha_list.json>
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime parse-artifact \
+  --run-id <run_id> --kind simulation_status --path <path/to/simulation_status.csv>
+```
+
+## Key Run Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset` | — | BRAIN dataset id (required) |
+| `--preset` | — | Named settings preset |
+| `--region` | — | BRAIN region (USA, EUR, GLB, etc.) |
+| `--delay` | — | Data delay |
+| `--universe` | — | Universe (TOP2500, TOP3000, etc.) |
+| `--data-type` | — | MATRIX or VECTOR |
+| `--decay` | 10 | BRAIN simulation decay |
+| `--truncation` | 0.08 | BRAIN simulation truncation |
+| `--neutralization` | INDUSTRY | BRAIN neutralization setting |
+| `--max-trade` | false | BRAIN maxTrade setting |
+| `--target-ready` | 4 | Stop after N submit-ready alphas |
+| `--max-iterations` | 6 | Max generate/simulate/enhance cycles |
+| `--batch-size` | 10 (4 GLB) | Alphas per batch |
+| `--concurrency` | 8 (4 GLB) | Concurrent simulation slots |
+| `--max-fields` | — | Limit datafields sent to LLM |
+| `--max-operators` | — | Limit operators sent to LLM |
+| `--max-sim-alphas` | — | Cap real simulation submissions |
+| `--max-variant-alphas` | 20 | Max variant alphas per iteration (0 to disable) |
+| `--max-variants-per-alpha` | 4 | Max variants per parent alpha |
+| `--use-llm-decide` | false | Use LLM for DECIDE phase |
+| `--max-enhance-actions` | 4 | Max enhancement actions per iteration |
+| `--make-prompt-version` | make-v1 | Prompt version for GENERATE |
+| `--enhance-prompt-version` | enhance-v1 | Prompt version for ENHANCE |
+| `--decision-prompt-version` | decision-v1 | Prompt version for DECIDE |
+| `--dry-run` | false | Local mock pipeline, no BRAIN/LLM calls |
+
+## Run Artifacts
+
+```text
+.brain_runtime/runs/<run_id>/
+  brain_agent.sqlite3       # SQLite database (runs, tasks, artifacts, candidates, sim_results, gate_checks)
+  run_report.md             # Research log with executive summary, decisions, failure diagnostics, recommendations
+  run_result.json           # Machine-readable run result
+  artifacts/                # Staged artifacts per pipeline phase
+  tasks/                    # Subprocess stdout/stderr logs
+```
+
+## Expression Constraints
+
+- **MATRIX** fields can be used directly in expressions.
+- **VECTOR** fields must be reduced first with `vec_*` (usually `vec_avg(field)`).
+- Put `ts_backfill` close to the field for sparse or quarterly data.
+- Prefer `multiply(-1, expr)` for sign flipping.
+- Avoid double-wrapping with `rank`/`zscore`/`group_neutralize` in variant search, as these can cause submission failures.
+
+## Field Factory
+
+Real inspect runs generate a small auxiliary alpha list from target datafield metadata: MATRIX fields are used directly, VECTOR fields are wrapped with `vec_avg(...)`, and low-coverage fields are backfilled. The result is recorded as `alpha_list_field_factory` and merged into `alpha_list_combined`.
+
+## Factor Thesis
+
+Every candidate carries a `factor_thesis` object. If the generator emits thesis fields, they are preserved; otherwise `brain_agent` infers a conservative thesis from the expression. Memory learns thesis types, expected failure modes, and intended repair methods. Reports include a Factor Thesis summary.
+
+## Concurrency Safety
+
+Avoid running another BRAIN simulation tool concurrently with `brain_agent` batch simulations for the same BRAIN account. They share platform quota and can increase 429 rate limits, platform queueing, and `Retry-After` waits.
+
+If a batch simulation appears stuck:
+1. Run `brain_agent tasks --refresh`.
+2. Read the `batchSim` task stdout/stderr logs.
+3. Look for `[BRAIN wait]` messages.
+4. Decide whether to keep waiting, cancel, retry, or resume.
+
+## Submission Safety
+
+Never call any production submission path unless the user explicitly confirms submission for specific alpha IDs. When the user says "不要自动 submit", only run checks and reports — list submit-ready alpha IDs for human review.
