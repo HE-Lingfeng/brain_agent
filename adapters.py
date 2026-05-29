@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,15 +15,19 @@ from .diagnostics import diagnose_sim_result
 from .memory import AlphaMemory, extract_operators, memory_path_for_run_dir
 from .models import AdapterResult, CandidateStatus, RunConfig
 from .prompting import prompt_env
+from .progress import build_simulation_progress, render_simulation_progress
+from .quota_allocator import allocate_simulation_quota
 from .repository import Repository
 from .scoring import score_candidate, score_candidates
 from .selection import classify_candidate
 from .task_runner import TaskRunner
+from .thesis import build_factor_thesis, load_idea_context, thesis_lineage_from_row
 from .utils import expression_fingerprint, file_sha256, read_json, write_json
+from .variant_search import build_variant_search, variant_lineage_from_row
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SKILLS_ROOT = REPO_ROOT / ".claude" / "skills"
+REPO_ROOT = Path(__file__).resolve().parent
+SKILLS_ROOT = REPO_ROOT / ".agents" / "skills"
 
 
 _LITERAL_TOKENS = {
@@ -56,7 +61,7 @@ _BUILTIN_EXPRESSION_SYMBOLS = {
     "vwap",
 }
 
-_ENHANCE_DEFAULT_MAX_OPERATORS = 10
+_ENHANCE_DEFAULT_MAX_OPERATORS = 5
 _ENHANCE_DEFAULT_MAX_DATAFIELDS = 4
 _GROUPING_SYMBOLS = {"country", "exchange", "industry", "market", "sector", "subindustry"}
 _BATCH_DIVERSITY_MIN_STRUCTURAL_THEMES = 4
@@ -159,9 +164,29 @@ class SkillAdapter:
                 stderr_path=handle.stderr_path,
             )
 
-        handle, returncode = runner.run_tracked(adapter, cmd, cwd, env=env, on_start=_record_running)
+        last_progress_line = {"text": ""}
+
+        def _print_progress(handle):
+            if adapter != "batchSim":
+                return
+            progress = build_simulation_progress(self.repo, self.run_id, self.run_dir)
+            line = render_simulation_progress(progress)
+            if line != last_progress_line["text"]:
+                print(line, flush=True)
+                last_progress_line["text"] = line
+
+        handle, returncode = runner.run_tracked(
+            adapter,
+            cmd,
+            cwd,
+            env=env,
+            on_start=_record_running,
+            on_progress=_print_progress if adapter == "batchSim" else None,
+            progress_interval_seconds=30,
+        )
         status = "completed" if returncode == 0 else "failed"
         self.repo.update_task_status(handle.task_id, status)
+        _print_progress(handle)
         return handle.task_id, returncode
 
     def config_stub(self) -> Path:
@@ -182,7 +207,10 @@ class MakeSomeGemAdapter(SkillAdapter):
         artifact_kind: str = "final_expressions",
         source_stage: str = "GENERATE",
     ) -> AdapterResult:
-        data = read_json(path)
+        try:
+            data = read_json(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            return AdapterResult(status="failed", error_summary=f"Could not parse final expressions JSON: {path}: {exc}")
         if isinstance(data, dict):
             expressions = data.get("expressions") or data.get("expression_list") or []
         else:
@@ -191,17 +219,22 @@ class MakeSomeGemAdapter(SkillAdapter):
             return AdapterResult(status="failed", error_summary=f"Unsupported final_expressions format: {path}")
 
         candidates = []
+        theses = []
         for item in expressions:
             if isinstance(item, str):
                 expression = item
                 idea_file = ""
+                item_data: dict[str, Any] = {}
             elif isinstance(item, dict):
+                item_data = item
                 expression = item.get("expression") or item.get("regular") or item.get("regular_expression") or ""
                 idea_file = item.get("idea_file") or item.get("source") or ""
             else:
                 continue
             if not expression:
                 continue
+            idea_context = _load_idea_context_near(path, idea_file) if idea_file else {}
+            thesis = build_factor_thesis(expression, item=item_data, idea_context=idea_context, source=source)
             fp = expression_fingerprint(expression)
             cid = self.repo.upsert_candidate(
                 self.run_id,
@@ -210,10 +243,17 @@ class MakeSomeGemAdapter(SkillAdapter):
                 status=CandidateStatus.GENERATED.value,
                 idea_file=idea_file,
                 source=source,
+                thesis=thesis,
             )
-            candidates.append({"candidate_id": cid, "expression": expression, "fingerprint": fp, "idea_file": idea_file})
+            candidates.append({"candidate_id": cid, "expression": expression, "fingerprint": fp, "idea_file": idea_file, "thesis": thesis})
+            theses.append({"candidate_id": cid, "fingerprint": fp, "expression": expression, "factor_thesis": thesis})
         artifact = self.record_artifact(artifact_kind, path, source_stage)
-        return AdapterResult(status="ok", artifacts=[artifact], candidates_delta=candidates)
+        artifacts = [artifact]
+        if theses:
+            thesis_path = path.with_name(path.stem + "_factor_theses.json")
+            write_json(thesis_path, theses)
+            artifacts.append(self.record_artifact("factor_theses", thesis_path, source_stage))
+        return AdapterResult(status="ok", artifacts=artifacts, candidates_delta=candidates)
 
     def dry_run(self, config: RunConfig) -> AdapterResult:
         path = self.artifacts_dir / "01_generate" / "final_expressions.json"
@@ -291,7 +331,10 @@ class InspectRawTemplateAdapter(SkillAdapter):
     name = "inspectRawTemplate"
 
     def parse_alpha_list(self, path: Path, source: str = "inspectRawTemplate") -> AdapterResult:
-        data = read_json(path)
+        try:
+            data = read_json(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            return AdapterResult(status="failed", error_summary=f"Could not parse alpha_list JSON: {path}: {exc}")
         if not isinstance(data, list):
             return AdapterResult(status="failed", error_summary=f"alpha_list must be a JSON list: {path}")
         candidates = []
@@ -305,6 +348,16 @@ class InspectRawTemplateAdapter(SkillAdapter):
             if _has_unresolved_bare_variable(expression):
                 continue
             fp = _candidate_fingerprint(expression, settings)
+            lineage = variant_lineage_from_row(item)
+            parent_candidate_id = lineage.get("parent_candidate_id")
+            thesis = thesis_lineage_from_row(item)
+            if not thesis:
+                thesis = build_factor_thesis(
+                    expression,
+                    item=item,
+                    idea_context=_load_idea_context_near(path, item.get("idea_file") or ""),
+                    source=source,
+                )
             cid = self.repo.upsert_candidate(
                 self.run_id,
                 expression,
@@ -312,6 +365,11 @@ class InspectRawTemplateAdapter(SkillAdapter):
                 status=CandidateStatus.SIM_PENDING.value,
                 idea_file=item.get("idea_file") or "",
                 source=source,
+                parent_candidate_id=int(parent_candidate_id) if parent_candidate_id else None,
+                variant_strategy=str(lineage.get("variant_strategy") or ""),
+                variant_params=lineage.get("variant_params") if isinstance(lineage.get("variant_params"), dict) else {},
+                lineage=lineage,
+                thesis=thesis,
             )
             score = score_candidate(
                 {
@@ -319,11 +377,14 @@ class InspectRawTemplateAdapter(SkillAdapter):
                     "expression": expression,
                     "status": CandidateStatus.SIM_PENDING.value,
                     "source": source,
+                    "parent_candidate_id": parent_candidate_id,
+                    "variant_strategy": lineage.get("variant_strategy") or "",
+                    "thesis_json": thesis,
                 },
                 memory_context=_memory_context_for_run_dir(self.run_dir, _run_config_filters(self.repo, self.run_id, settings)),
             )
             self.repo.update_candidate_score(self.run_id, cid, score.score, score.breakdown)
-            candidates.append({"candidate_id": cid, "expression": expression, "fingerprint": fp, "settings": settings})
+            candidates.append({"candidate_id": cid, "expression": expression, "fingerprint": fp, "settings": settings, "thesis": thesis})
         artifact = self.record_artifact("alpha_list", path, "INSPECT")
         return AdapterResult(status="ok", artifacts=[artifact], candidates_delta=candidates)
 
@@ -333,7 +394,11 @@ class InspectRawTemplateAdapter(SkillAdapter):
         rows = []
         settings = _settings_from_config(config)
         for row in generated:
-            rows.append({"type": "REGULAR", "settings": settings, "regular": row["expression"]})
+            alpha_row = {"type": "REGULAR", "settings": settings, "regular": row["expression"]}
+            thesis = _json_obj(row.get("thesis_json"))
+            if thesis:
+                alpha_row["factor_thesis"] = thesis
+            rows.append(alpha_row)
         write_json(path, rows)
         return self.parse_alpha_list(path, source="dry_run_inspect")
 
@@ -403,6 +468,19 @@ class InspectRawTemplateAdapter(SkillAdapter):
         self.record_artifact("alpha_list_combined", out, "INSPECT")
         return out
 
+    def write_field_factory_alpha_list(self, config: RunConfig, *, max_rows: int | None = None) -> AdapterResult:
+        """Build a small deterministic alpha list directly from datafield metadata."""
+        env = _credential_env(require_brain=True, require_llm=False)
+        fields = _load_datafield_metadata(config, self.artifacts_dir / "02_inspect" / "datafields", env)
+        rows = _field_factory_alpha_rows(config, fields, max_rows=max_rows)
+        if not rows:
+            return AdapterResult(status="ok")
+        out = self.artifacts_dir / "02_inspect" / "alpha_list_field_factory.json"
+        write_json(out, rows)
+        parsed = self.parse_alpha_list(out, source="field_factory")
+        parsed.artifacts.append(self.record_artifact("alpha_list_field_factory", out, "INSPECT"))
+        return parsed
+
     def write_alpha_list_for_candidates(
         self,
         candidates: list[dict[str, Any]],
@@ -411,11 +489,18 @@ class InspectRawTemplateAdapter(SkillAdapter):
         name: str = "alpha_list_candidates.json",
     ) -> Path:
         settings = _settings_from_config(config)
-        rows = [
-            {"type": "REGULAR", "settings": settings, "regular": str(candidate.get("expression") or "")}
-            for candidate in candidates
-            if candidate.get("expression")
-        ]
+        rows = []
+        for candidate in candidates:
+            expression = str(candidate.get("expression") or "")
+            if not expression:
+                continue
+            row = {"type": "REGULAR", "settings": settings, "regular": expression}
+            thesis = thesis_lineage_from_row(candidate)
+            if not thesis and candidate.get("thesis_json"):
+                thesis = thesis_lineage_from_row({"thesis_json": _json_obj(candidate.get("thesis_json"))})
+            if thesis:
+                row["factor_thesis"] = thesis
+            rows.append(row)
         out = self.artifacts_dir / "02_inspect" / name
         write_json(out, rows)
         self.record_artifact("alpha_list_generated", out, "INSPECT")
@@ -423,13 +508,59 @@ class InspectRawTemplateAdapter(SkillAdapter):
         return out
 
 
+class VariantSearchAdapter(SkillAdapter):
+    name = "variantSearch"
+
+    def run(self, alpha_list_path: Path, config: RunConfig, *, iteration: int) -> AdapterResult:
+        try:
+            rows = read_json(alpha_list_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            return AdapterResult(status="failed", error_summary=f"Could not parse alpha_list for variant search: {alpha_list_path}: {exc}")
+        if not isinstance(rows, list):
+            return AdapterResult(status="failed", error_summary=f"alpha_list must be a JSON list: {alpha_list_path}")
+
+        pnl_series = _load_pnl_cache(self.run_dir)
+        variant_rows, report = build_variant_search(
+            rows,
+            self.repo.list_rows("candidates", self.run_id),
+            self.repo.latest_sim_results_by_candidate(self.run_id),
+            max_variant_alphas=int(config.max_variant_alphas),
+            max_variants_per_alpha=int(config.max_variants_per_alpha),
+            latest_gate_by_candidate=_latest_gate_by_candidate(self.repo, self.run_id),
+            pnl_series_by_alpha_id=pnl_series if pnl_series else None,
+        )
+        out = self.artifacts_dir / "04_variants" / f"alpha_list_variants_iter{iteration}.json"
+        report_path = self.artifacts_dir / "04_variants" / f"variant_search_report_iter{iteration}.json"
+        write_json(out, variant_rows)
+        write_json(report_path, report)
+        artifacts = [
+            self.record_artifact("alpha_list_variants", out, "VARIANT_SEARCH"),
+            self.record_artifact("variant_search_report", report_path, "VARIANT_SEARCH"),
+        ]
+        if not variant_rows:
+            return AdapterResult(status="ok", artifacts=artifacts)
+        parsed = InspectRawTemplateAdapter(self.repo, self.run_id, self.run_dir).parse_alpha_list(
+            out,
+            source="variant_search",
+        )
+        parsed.artifacts = artifacts + parsed.artifacts
+        return parsed
+
+
 class BatchSimAdapter(SkillAdapter):
     name = "batchSim"
 
     def parse_simulation_status(self, path: Path) -> AdapterResult:
         metrics = []
-        with path.open("r", encoding="utf-8", newline="") as f:
-            for row in csv.DictReader(f):
+        try:
+            f = path.open("r", encoding="utf-8", newline="")
+        except OSError as exc:
+            return AdapterResult(status="failed", error_summary=f"Could not open simulation status CSV: {path}: {exc}")
+        with f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return AdapterResult(status="failed", error_summary=f"simulation status CSV has no header: {path}")
+            for row in reader:
                 expression = row.get("regular_expression") or row.get("regular") or row.get("expression") or ""
                 settings = _json_obj(row.get("settings_json"))
                 legacy_fp = row.get("fingerprint") or ""
@@ -564,7 +695,7 @@ class BatchSimAdapter(SkillAdapter):
         alpha_dest = copy_artifact_to_run(alpha_list_path, self.artifacts_dir / "03_simulate" / "input")
         alpha_dest = self._score_sorted_alpha_list(alpha_dest)
         if config.max_sim_alphas is not None:
-            alpha_dest = _limited_alpha_list(alpha_dest, int(config.max_sim_alphas))
+            alpha_dest = self._allocate_alpha_list_quota(alpha_dest, int(config.max_sim_alphas))
         preflight = self._preflight_alpha_list_fields(alpha_dest, config, env)
         if preflight.status != "ok":
             return preflight
@@ -607,6 +738,7 @@ class BatchSimAdapter(SkillAdapter):
         if not output_csv.exists():
             return AdapterResult(status="failed", error_summary=f"batch simulation CSV missing: {output_csv}")
         parsed = self.parse_simulation_status(output_csv)
+        _update_pnl_cache_from_metrics(self.run_dir, parsed.metrics_delta, env)
         parsed.artifacts = preflight_artifacts + parsed.artifacts
         parsed.metrics_delta = preflight_metrics + parsed.metrics_delta
         return parsed
@@ -624,7 +756,20 @@ class BatchSimAdapter(SkillAdapter):
             return AdapterResult(status="ok")
         field_result = self._available_datafields(config, env)
         if field_result.status != "ok":
-            return field_result
+            incomplete_path = self.artifacts_dir / "03_simulate" / "datafields_preflight_incomplete.json"
+            write_json(
+                incomplete_path,
+                {
+                    "status": "incomplete",
+                    "error_type": _platform_error_type(field_result.error_summary),
+                    "error": field_result.error_summary,
+                    "policy": "Datafield availability preflight is non-fatal; continue to batch simulation and let simulator/platform errors be recorded per alpha.",
+                },
+            )
+            return AdapterResult(
+                status="ok",
+                artifacts=[self.record_artifact("datafields_preflight_incomplete", incomplete_path, "SIMULATE")],
+            )
         available_fields = set(field_result.candidates_delta[0].get("field_ids") or [])
         allowed = available_fields | _BUILTIN_EXPRESSION_SYMBOLS
         keep_rows = []
@@ -759,6 +904,7 @@ class BatchSimAdapter(SkillAdapter):
             candidates,
             self.repo.latest_sim_results_by_candidate(self.run_id),
             _memory_context_for_run_dir(self.run_dir, _run_config_filters(self.repo, self.run_id, _settings_from_alpha_rows(rows))),
+            _latest_gate_by_candidate(self.repo, self.run_id),
         )
         by_candidate_id = {
             int(candidate["candidate_id"]): candidate
@@ -789,6 +935,22 @@ class BatchSimAdapter(SkillAdapter):
         out = alpha_list_path.with_name(alpha_list_path.stem + "_score_sorted.json")
         write_json(out, sorted_rows)
         self.record_artifact("alpha_list_score_sorted", out, "SIMULATE")
+        return out
+
+    def _allocate_alpha_list_quota(self, alpha_list_path: Path, limit: int) -> Path:
+        if limit <= 0:
+            return alpha_list_path
+        rows = read_json(alpha_list_path)
+        if not isinstance(rows, list) or len(rows) <= limit:
+            return alpha_list_path
+        candidates = self.repo.list_rows("candidates", self.run_id)
+        selected, report = allocate_simulation_quota(rows, candidates, limit=limit)
+        out = alpha_list_path.with_name(f"{alpha_list_path.stem}_quota{limit}{alpha_list_path.suffix}")
+        report_path = alpha_list_path.with_name(f"{alpha_list_path.stem}_quota{limit}_report.json")
+        write_json(out, selected)
+        write_json(report_path, report)
+        self.record_artifact("alpha_list_quota_allocated", out, "SIMULATE")
+        self.record_artifact("alpha_list_quota_report", report_path, "SIMULATE")
         return out
 
 
@@ -1004,27 +1166,35 @@ class SubmissionGateAdapter(SkillAdapter):
                 sys.path.insert(0, str(shared_scripts))
             import ace_lib  # type: ignore
 
-            session = ace_lib.start_session()
             gate_rows = []
+            try:
+                session = ace_lib.start_session()
+            except Exception as exc:
+                for row in rows:
+                    gate = _gate_error_row(row, exc, ["session"])
+                    self.repo.add_gate_check(self.run_id, gate)
+                    gate_rows.append(gate)
+                path = self.artifacts_dir / "06_gate" / "gate_checks.json"
+                write_json(path, gate_rows)
+                artifact = self.record_artifact("gate_checks", path, "SUBMIT_GATE")
+                return AdapterResult(status="ok", artifacts=[artifact], metrics_delta=gate_rows)
+
+            latest_sim = self.repo.latest_sim_results_by_candidate(self.run_id)
+            memory_context = _memory_context_for_run_dir(self.run_dir, _run_config_filters(self.repo, self.run_id))
             for row in rows:
-                try:
-                    gate = _run_gate_for_alpha(ace_lib, session, row)
-                except Exception as exc:
-                    gate = {
-                        "candidate_id": row.get("candidate_id"),
-                        "alpha_id": row.get("alpha_id") or "",
-                        "submission_check": "ERROR",
-                        "self_corr_check": "ERROR",
-                        "prod_corr_check": "ERROR",
-                        "weight_check": "ERROR",
-                        "subuniverse_check": "ERROR",
-                        "passed": False,
-                        "error": str(exc)[:500],
-                    }
+                gate = _run_gate_for_alpha(ace_lib, session, row)
                 self.repo.add_gate_check(self.run_id, gate)
+                candidate_id = int(row.get("candidate_id") or 0)
+                if candidate_id:
+                    score = score_candidate(row, latest_sim.get(candidate_id), memory_context, gate)
+                    self.repo.update_candidate_score(self.run_id, candidate_id, score.score, score.breakdown)
                 if gate.get("passed"):
                     self.repo.update_candidate_status(self.run_id, row["fingerprint"], CandidateStatus.SUBMIT_READY.value)
                 gate_rows.append(gate)
+        except Exception as exc:
+            gate_rows = [_gate_error_row(row, exc, ["gate_runtime"]) for row in rows]
+            for gate in gate_rows:
+                self.repo.add_gate_check(self.run_id, gate)
         finally:
             os.environ.clear()
             os.environ.update(old_env)
@@ -1303,11 +1473,25 @@ def _float_or_none(value: Any) -> float | None:
 def _json_obj(value: Any) -> dict[str, Any]:
     if not value:
         return {}
+    if isinstance(value, dict):
+        return value
     try:
-        data = json.loads(value)
+        data = json.loads(str(value))
     except (TypeError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _load_idea_context_near(anchor_path: Path, idea_file: Any) -> dict[str, Any]:
+    raw = str(idea_file or "").strip()
+    if not raw:
+        return {}
+    path = Path(raw)
+    if not path.is_absolute():
+        near = anchor_path.parent / path
+        if near.exists():
+            path = near
+    return load_idea_context(path)
 
 
 def _settings_from_config(config: RunConfig) -> dict[str, Any]:
@@ -1436,12 +1620,22 @@ def _credential_env(*, require_brain: bool, require_llm: bool) -> dict[str, str]
     if creds.get("brain_password"):
         env["BRAIN_PASSWORD"] = creds["brain_password"]
         env["BRAIN_CREDENTIAL_PASSWORD"] = creds["brain_password"]
-    if creds.get("moonshot_api_key"):
-        env["MOONSHOT_API_KEY"] = creds["moonshot_api_key"]
-    if creds.get("moonshot_base_url"):
-        env["MOONSHOT_BASE_URL"] = creds["moonshot_base_url"]
-    if creds.get("moonshot_model"):
-        env["MOONSHOT_MODEL"] = creds["moonshot_model"]
+    if creds.get("llm_provider"):
+        env["BRAIN_LLM_PROVIDER"] = creds["llm_provider"]
+        env["LLM_PROVIDER"] = creds["llm_provider"]
+    if creds.get("llm_api_key"):
+        env["LLM_API_KEY"] = creds["llm_api_key"]
+        env["MOONSHOT_API_KEY"] = creds["llm_api_key"]
+        if creds.get("llm_provider") == "deepseek":
+            env["DEEPSEEK_API_KEY"] = creds["llm_api_key"]
+        if creds.get("llm_provider") == "openai":
+            env["OPENAI_API_KEY"] = creds["llm_api_key"]
+    if creds.get("llm_base_url"):
+        env["LLM_BASE_URL"] = creds["llm_base_url"]
+        env["MOONSHOT_BASE_URL"] = creds["llm_base_url"]
+    if creds.get("llm_model"):
+        env["LLM_MODEL"] = creds["llm_model"]
+        env["MOONSHOT_MODEL"] = creds["llm_model"]
     return env
 
 
@@ -1519,6 +1713,205 @@ def _truncate_for_prompt(value: str, max_chars: int) -> str:
     return text[: max(0, max_chars - 3)].rstrip() + "..."
 
 
+def _latest_gate_by_candidate(repo: Repository, run_id: str) -> dict[int, dict[str, Any]]:
+    latest: dict[int, dict[str, Any]] = {}
+    for row in repo.list_rows("gate_checks", run_id):
+        candidate_id = int(row.get("candidate_id") or 0)
+        if candidate_id:
+            latest[candidate_id] = row
+    return latest
+
+
+def _load_pnl_cache(run_dir: Path) -> dict[str, list[float]] | None:
+    cache_path = run_dir / "pnl_cache.json"
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    result: dict[str, list[float]] = {}
+    for key, value in data.items():
+        if isinstance(value, list):
+            result[str(key)] = [float(v) for v in value if v is not None]
+    return result or None
+
+
+def _update_pnl_cache_from_metrics(run_dir: Path, metrics: list[dict[str, Any]], env: dict[str, str], *, max_fetch: int = 80) -> None:
+    alpha_ids = []
+    for row in metrics:
+        alpha_id = str(row.get("alpha_id") or "")
+        if alpha_id and str(row.get("status") or "").upper() in {"COMPLETE", "COMPLETED"}:
+            alpha_ids.append(alpha_id)
+    if not alpha_ids:
+        return
+    cache_path = run_dir / "pnl_cache.json"
+    cache = _load_pnl_cache(run_dir) or {}
+    missing = [alpha_id for alpha_id in dict.fromkeys(alpha_ids) if alpha_id not in cache][:max_fetch]
+    if not missing:
+        return
+    old_env = os.environ.copy()
+    os.environ.update(env)
+    try:
+        shared_scripts = SKILLS_ROOT / "brain-shared" / "scripts"
+        if str(shared_scripts) not in sys.path:
+            sys.path.insert(0, str(shared_scripts))
+        import ace_lib  # type: ignore
+
+        session = ace_lib.start_session()
+        for alpha_id in missing:
+            try:
+                series = _pnl_series_from_frame(ace_lib.get_alpha_pnl(session, alpha_id))
+            except Exception:
+                continue
+            if series:
+                cache[alpha_id] = series
+    except Exception:
+        return
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+    if cache:
+        write_json(cache_path, cache)
+
+
+def _pnl_series_from_frame(frame: Any) -> list[float]:
+    try:
+        if bool(frame.empty):
+            return []
+    except Exception:
+        pass
+    columns = list(getattr(frame, "columns", []) or [])
+    preferred = next((col for col in ("pnl", "PnL", "dailyPnl", "daily_pnl") if col in columns), None)
+    if preferred is None:
+        preferred = next((col for col in columns if str(col).lower() not in {"alpha_id", "date"}), None)
+    if preferred is None:
+        return []
+    try:
+        values = frame[preferred].dropna().astype(float).tolist()
+    except Exception:
+        return []
+    return [float(value) for value in values]
+
+
+def _load_datafield_metadata(config: RunConfig, cache_dir: Path, env: dict[str, str]) -> list[dict[str, Any]]:
+    cache = cache_dir / f"{config.dataset}_{config.region}_delay{config.delay}_{config.universe}_{config.data_type}.json"
+    if cache.exists():
+        try:
+            data = read_json(cache)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if isinstance(data, dict) and isinstance(data.get("fields"), list):
+            return [row for row in data["fields"] if isinstance(row, dict)]
+    old_env = os.environ.copy()
+    os.environ.update(env)
+    try:
+        shared_scripts = SKILLS_ROOT / "brain-shared" / "scripts"
+        if str(shared_scripts) not in sys.path:
+            sys.path.insert(0, str(shared_scripts))
+        import ace_lib  # type: ignore
+
+        session = ace_lib.start_session()
+        df = ace_lib.get_datafields(
+            session,
+            instrument_type="EQUITY",
+            region=config.region,
+            delay=config.delay,
+            universe=config.universe,
+            dataset_id=config.dataset,
+            data_type=config.data_type,
+        )
+        fields = _datafield_records_from_df(df)
+    except Exception:
+        return []
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+    write_json(
+        cache,
+        {
+            "dataset": config.dataset,
+            "region": config.region,
+            "delay": config.delay,
+            "universe": config.universe,
+            "data_type": config.data_type,
+            "field_ids": sorted(str(row.get("id") or "") for row in fields if row.get("id")),
+            "fields": fields,
+        },
+    )
+    return fields
+
+
+def _datafield_records_from_df(df: Any) -> list[dict[str, Any]]:
+    try:
+        records = df.to_dict("records")
+    except Exception:
+        return []
+    normalized = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        field_id = str(row.get("id") or row.get("field_id") or row.get("fieldId") or "").strip()
+        if not field_id:
+            continue
+        normalized.append(
+            {
+                "id": field_id,
+                "type": str(row.get("type") or row.get("dataType") or row.get("data_type") or "").upper(),
+                "coverage": _float_or_none(row.get("coverage")),
+                "userCount": _float_or_none(row.get("userCount") or row.get("user_count")),
+                "alphaCount": _float_or_none(row.get("alphaCount") or row.get("alpha_count")),
+            }
+        )
+    return normalized
+
+
+def _field_factory_alpha_rows(config: RunConfig, fields: list[dict[str, Any]], *, max_rows: int | None = None) -> list[dict[str, Any]]:
+    settings = _settings_from_config(config)
+    rows = []
+    field_limit = max(1, min(int(config.max_fields or 8), 20))
+    row_limit = max_rows if max_rows is not None else field_limit * 2
+    selected = sorted(fields, key=lambda row: (_field_coverage(row), str(row.get("id") or "")), reverse=True)[:field_limit]
+    for field in selected:
+        field_id = str(field.get("id") or "").strip()
+        if not field_id:
+            continue
+        base = _field_factory_base_expression(field_id, str(field.get("type") or config.data_type).upper())
+        coverage = _field_coverage(field)
+        signal = f"ts_backfill({base}, 60)" if coverage and coverage < 0.70 else base
+        expressions = [
+            f"rank(ts_mean({signal}, 20))",
+            f"rank(winsorize(ts_delta({signal}, 5), std=4))",
+        ]
+        for expression in expressions:
+            rows.append(
+                {
+                    "type": "REGULAR",
+                    "settings": settings,
+                    "regular": expression,
+                    "lineage": {"variant_strategy": "field_factory", "field_id": field_id, "coverage": coverage},
+                    "variant_strategy": "field_factory",
+                    "variant_params": {"field_id": field_id, "coverage": coverage},
+                }
+            )
+            if row_limit and len(rows) >= row_limit:
+                return rows
+    return rows
+
+
+def _field_factory_base_expression(field_id: str, data_type: str) -> str:
+    if str(data_type or "").upper() == "VECTOR":
+        return f"vec_avg({field_id})"
+    return field_id
+
+
+def _field_coverage(field: dict[str, Any]) -> float:
+    value = _float_or_none(field.get("coverage"))
+    return float(value) if value is not None else 0.0
+
+
 def _short_flip_suggestions(expression: str) -> list[str]:
     expr = " ".join(str(expression or "").split())
     if not expr:
@@ -1528,33 +1921,195 @@ def _short_flip_suggestions(expression: str) -> list[str]:
 
 def _run_gate_for_alpha(ace_lib: Any, session: Any, candidate: dict[str, Any]) -> dict[str, Any]:
     alpha_id = str(candidate.get("alpha_id") or "")
-    submission_df = ace_lib.get_check_submission(session, alpha_id)
-    self_df = ace_lib.check_self_corr_test(session, alpha_id)
-    prod_df = ace_lib.check_prod_corr_test(session, alpha_id)
-
-    submission_records = _df_records(submission_df)
-    self_records = _df_records(self_df)
-    prod_records = _df_records(prod_df)
+    submission_records, submission_error = _submission_gate_records(ace_lib, session, alpha_id)
+    self_records, self_error = _safe_gate_records("self_corr", lambda: ace_lib.check_self_corr_test(session, alpha_id))
+    prod_records, prod_error = _safe_gate_records("prod_corr", lambda: ace_lib.check_prod_corr_test(session, alpha_id))
+    submission_records = _normalize_gate_records(submission_records)
+    self_records = _normalize_gate_records(self_records)
+    prod_records = _normalize_gate_records(prod_records)
+    submission_scoring_records = _non_correlation_submission_records(submission_records)
+    errors = {
+        name: err
+        for name, err in {
+            "submission": submission_error,
+            "self_corr": self_error,
+            "prod_corr": prod_error,
+        }.items()
+        if err
+    }
     checks = submission_records + self_records + prod_records
-    passed = bool(checks) and all(str(item.get("result", "")).upper() == "PASS" for item in checks)
+    passed = (
+        bool(submission_scoring_records)
+        and bool(self_records)
+        and bool(prod_records)
+        and not errors
+        and _all_pass(submission_scoring_records)
+        and _all_pass(self_records)
+        and _all_pass(prod_records)
+    )
 
-    by_test = {str(item.get("test", "")).upper(): str(item.get("result", "")) for item in checks}
+    submission_by_test = {str(item.get("test", "")).upper(): str(item.get("result", "")) for item in submission_scoring_records}
+    corr_by_test = {str(item.get("test", "")).upper(): str(item.get("result", "")) for item in self_records + prod_records}
+    error_type = _gate_error_type(list(errors.values()))
     return {
         "candidate_id": candidate.get("candidate_id"),
         "alpha_id": alpha_id,
-        "submission_check": "PASS" if submission_records and _all_pass(submission_records) else "FAIL",
-        "self_corr_check": by_test.get("SELF_CORRELATION", "UNKNOWN"),
-        "prod_corr_check": by_test.get("PROD_CORRELATION", "UNKNOWN"),
-        "weight_check": by_test.get("WEIGHT", by_test.get("WEIGHT_CONCENTRATION", "UNKNOWN")),
-        "subuniverse_check": by_test.get("SUB_UNIVERSE_SHARPE", by_test.get("SUBUNIVERSE", "UNKNOWN")),
+        "submission_check": "ERROR" if submission_error else ("PASS" if submission_scoring_records and _all_pass(submission_scoring_records) else "FAIL"),
+        "self_corr_check": "ERROR" if self_error else corr_by_test.get("SELF_CORRELATION", "UNKNOWN"),
+        "prod_corr_check": "ERROR" if prod_error else corr_by_test.get("PROD_CORRELATION", "UNKNOWN"),
+        "weight_check": _first_check_result(
+            submission_by_test,
+            "WEIGHT",
+            "WEIGHT_CONCENTRATION",
+            "CONCENTRATED_WEIGHT",
+        ),
+        "subuniverse_check": _first_check_result(
+            submission_by_test,
+            "SUB_UNIVERSE_SHARPE",
+            "SUBUNIVERSE",
+            "LOW_SUB_UNIVERSE_SHARPE",
+        ),
+        "gate_status": "incomplete" if errors else "complete",
+        "error_type": error_type,
+        "incomplete_checks": sorted(errors),
+        "error": "; ".join(f"{name}: {err}" for name, err in sorted(errors.items()))[:1000],
         "passed": passed,
         "checks": checks,
     }
 
 
+def _submission_gate_records(ace_lib: Any, session: Any, alpha_id: str) -> tuple[list[dict[str, Any]], str]:
+    primary_records, primary_error = _safe_gate_records(
+        "submission", lambda: ace_lib.get_check_submission(session, alpha_id)
+    )
+    if primary_records:
+        return primary_records, ""
+
+    base_url = str(getattr(ace_lib, "brain_api_url", "https://api.worldquantbrain.com")).rstrip("/")
+    detail_records, detail_error = _safe_gate_records(
+        "alpha_detail_checks", lambda: _alpha_detail_submission_checks(session, alpha_id, base_url)
+    )
+    if detail_records:
+        return detail_records, ""
+    if primary_error:
+        joined = "; ".join(part for part in [f"/check: {primary_error}", f"/alphas: {detail_error}" if detail_error else ""] if part)
+        return [], joined[:500]
+    return [], ""
+
+
+def _alpha_detail_submission_checks(session: Any, alpha_id: str, base_url: str) -> list[dict[str, Any]]:
+    for _ in range(3):
+        response = session.get(f"{base_url}/alphas/{alpha_id}")
+        retry_after = _header_value(response, "Retry-After") or _header_value(response, "retry-after")
+        if not retry_after:
+            break
+        time.sleep(float(retry_after))
+    if hasattr(response, "raise_for_status"):
+        response.raise_for_status()
+    payload = response.json()
+    checks = ((payload or {}).get("is") or {}).get("checks") or []
+    return [dict(item, alpha_id=alpha_id) for item in checks if isinstance(item, dict)]
+
+
+def _header_value(response: Any, name: str) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        return str(headers.get(name) or "")
+    except Exception:
+        return ""
+
+
+def _normalize_gate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        record = dict(item)
+        test = record.get("test") or record.get("name")
+        if test:
+            record["test"] = str(test).upper()
+        result = record.get("result")
+        if result:
+            record["result"] = str(result).upper()
+        normalized.append(record)
+    return normalized
+
+
+def _non_correlation_submission_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    correlation_tests = {"SELF_CORRELATION", "PROD_CORRELATION"}
+    return [record for record in records if str(record.get("test") or "").upper() not in correlation_tests]
+
+
+def _first_check_result(by_test: dict[str, str], *names: str) -> str:
+    for name in names:
+        result = by_test.get(name)
+        if result:
+            return result
+    return "UNKNOWN"
+
+
+def _safe_gate_records(name: str, func: Any) -> tuple[list[dict[str, Any]], str]:
+    try:
+        return _df_records(func()), ""
+    except Exception as exc:
+        return [], str(exc)[:500]
+
+
+def _gate_error_row(candidate: dict[str, Any], exc: Exception, checks: list[str]) -> dict[str, Any]:
+    error = str(exc)[:1000]
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "alpha_id": candidate.get("alpha_id") or "",
+        "submission_check": "ERROR",
+        "self_corr_check": "ERROR",
+        "prod_corr_check": "ERROR",
+        "weight_check": "ERROR",
+        "subuniverse_check": "ERROR",
+        "gate_status": "incomplete",
+        "error_type": _gate_error_type([error]),
+        "incomplete_checks": sorted(set(checks)),
+        "passed": False,
+        "error": error,
+    }
+
+
+def _platform_error_type(error: Any) -> str:
+    return _gate_error_type([str(error or "")]) or "platform_error"
+
+
+def _gate_error_type(errors: list[str]) -> str:
+    text = " ".join(str(err or "").lower() for err in errors)
+    if not text:
+        return ""
+    network_terms = (
+        "proxy",
+        "connection",
+        "connect",
+        "timeout",
+        "timed out",
+        "retry",
+        "ssl",
+        "tls",
+        "dns",
+        "name resolution",
+        "temporarily unavailable",
+        "remote disconnected",
+        "connection aborted",
+        "connection reset",
+        "429",
+        "rate limit",
+        "retry-after",
+    )
+    if any(term in text for term in network_terms):
+        return "network_error"
+    return "gate_error"
+
+
 def _df_records(df: Any) -> list[dict[str, Any]]:
     if df is None:
         return []
+    if isinstance(df, list):
+        return [dict(item) for item in df if isinstance(item, dict)]
     try:
         if bool(df.empty):
             return []

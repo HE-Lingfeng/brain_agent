@@ -20,6 +20,8 @@ def diagnose_sim_result(result: dict[str, Any]) -> dict[str, Any]:
     lower_error = error.lower()
     upper_status = status.upper()
 
+    retryable = is_retryable_sim_failure(status=status, error=error)
+
     if error:
         if any(
             token in lower_error
@@ -43,11 +45,15 @@ def diagnose_sim_result(result: dict[str, Any]) -> dict[str, Any]:
             _add(tags, "syntax_error")
             _add(objectives, "fix_syntax")
             reasons.append("Simulation failed because the expression/operator syntax is invalid.")
+        elif "subuniverse" in lower_error or "sub-universe" in lower_error:
+            _add(tags, "subuniverse_issue")
+            _add(objectives, "improve_coverage")
+            reasons.append("Simulation error suggests the alpha does not cover enough of the target subuniverse.")
         elif any(token in lower_error for token in ("coverage", "insufficient", "empty universe", "no stocks")):
             _add(tags, "coverage_issue")
             _add(objectives, "improve_coverage")
             reasons.append("Simulation error suggests poor field coverage or too few tradable stocks.")
-        elif any(token in lower_error for token in ("timeout", "rate limit", "429", "retry-after")):
+        elif retryable or any(token in lower_error for token in ("timeout", "rate limit", "429", "retry-after")):
             _add(tags, "platform_or_rate_limit")
             reasons.append("Failure appears related to platform timeout or rate limiting.")
         else:
@@ -57,6 +63,10 @@ def diagnose_sim_result(result: dict[str, Any]) -> dict[str, Any]:
     if upper_status and upper_status not in {"COMPLETE", "COMPLETED", "SUCCESS"}:
         _add(tags, "sim_failed")
         reasons.append(f"Simulation status is {status}.")
+        if retryable:
+            _add(tags, "sim_retryable")
+            _add(objectives, "retry_simulation")
+            reasons.append("Failure appears transient; retry the same simulation payload before judging alpha quality.")
 
     if turnover is not None:
         if turnover > 0.70:
@@ -107,6 +117,85 @@ def diagnose_sim_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def is_retryable_sim_failure(*, status: str = "", error: str = "") -> bool:
+    """Return true for platform/queue failures that should be retried unchanged."""
+    upper_status = str(status or "").upper()
+    lower_error = str(error or "").lower()
+    if upper_status in {"TIMEOUT", "BATCH_SPAWN_FAILED"}:
+        return True
+    if upper_status == "SUBMISSION_FAILED":
+        return any(
+            token in lower_error
+            for token in (
+                "429",
+                "rate limit",
+                "retry-after",
+                "too many",
+                "temporarily",
+                "timeout",
+                "timed out",
+                "platform",
+                "queue",
+                "try again",
+                "service unavailable",
+                "502",
+                "503",
+                "504",
+            )
+        )
+    if any(token in lower_error for token in ("parent status: none", "batch parent", "spawn children")):
+        return True
+    return False
+
+
+def diagnose_gate_check(result: dict[str, Any]) -> dict[str, Any]:
+    """Convert submit-gate checks into repair-oriented diagnostics."""
+
+    tags: list[str] = []
+    reasons: list[str] = []
+    objectives: list[str] = []
+    self_corr = str(result.get("self_corr_check") or "").upper()
+    prod_corr = str(result.get("prod_corr_check") or "").upper()
+    subuniverse = str(result.get("subuniverse_check") or "").upper()
+    submission = str(result.get("submission_check") or "").upper()
+    error = str(result.get("error") or "")
+    gate_status = str(result.get("gate_status") or "").lower()
+    error_type = str(result.get("error_type") or "").lower()
+
+    if gate_status == "incomplete":
+        _add(tags, "gate_incomplete")
+        reasons.append("Submit gate check was incomplete; treat this as missing gate evidence rather than an alpha quality failure.")
+    if error_type:
+        _add(tags, error_type)
+        if error_type == "network_error":
+            reasons.append("Submit gate check hit a network/proxy/rate-limit style error.")
+    if _is_failed_check(self_corr):
+        _add(tags, "self_corr_high")
+        _add(objectives, "reduce_self_correlation")
+        reasons.append("Submit gate self-correlation check did not pass.")
+    if _is_failed_check(prod_corr):
+        _add(tags, "prod_corr_high")
+        _add(objectives, "reduce_prod_correlation")
+        reasons.append("Submit gate production-correlation check did not pass.")
+    if _is_failed_check(subuniverse):
+        _add(tags, "subuniverse_issue")
+        _add(objectives, "improve_coverage")
+        reasons.append("Submit gate subuniverse check did not pass.")
+    if _is_failed_check(submission) and not tags:
+        _add(tags, "submission_gate_failed")
+        reasons.append("Submit gate failed without a more specific local category.")
+    if error and gate_status != "incomplete":
+        _add(tags, "gate_error")
+        reasons.append("Submit gate check returned an error.")
+
+    return {
+        "failure_tags": tags,
+        "repair_objectives": objectives,
+        "diagnosis_reasons": reasons,
+        "repair_hints": _repair_hints(tags),
+    }
+
+
 def summarize_failure_tags(rows: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -137,12 +226,18 @@ def _repair_hints(tags: list[str]) -> list[str]:
         hints.append("Keep placeholders unchanged and use only dataset fields/operators available to this run.")
     if "datafield_unavailable" in tags:
         hints.append("Switch to fields returned by the target region/universe datafields API, or rerun generation for that target universe.")
-    if "coverage_issue" in tags:
+    if "coverage_issue" in tags or "subuniverse_issue" in tags:
         hints.append("Prefer higher-coverage fields, add ts_backfill, or avoid overly restrictive trade_when conditions.")
     if "low_turnover" in tags:
         hints.append("Relax entry conditions or reduce excessive smoothing so the alpha trades enough.")
     if "cand_neg" in tags:
         hints.append("Generate short-flip variants such as multiply(-1, expr) before discarding this signal.")
+    if "self_corr_high" in tags or "prod_corr_high" in tags:
+        hints.append("Reduce correlation via alternate neutralization, group-neutralization, window perturbation, or stronger signal de-correlation.")
+    if "gate_incomplete" in tags or "network_error" in tags:
+        hints.append("Retry gate checks later; do not treat incomplete gate evidence as a failed research result.")
+    if "sim_retryable" in tags:
+        hints.append("Retry the same simulation payload later; this looks like platform queueing, timeout, or rate limiting.")
     return hints
 
 
@@ -179,3 +274,9 @@ def _is_short_flip_candidate(
     if turnover is not None and (turnover < 0.01 or turnover > 0.70):
         return False
     return True
+
+
+def _is_failed_check(value: str) -> bool:
+    if not value:
+        return False
+    return value.upper() not in {"PASS", "PASSED", "PENDING", "UNKNOWN", "ERROR", "N/A", "NA"}

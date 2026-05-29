@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS candidates (
   source TEXT,
   selection_score REAL DEFAULT 0,
   score_breakdown TEXT DEFAULT '{}',
+  parent_candidate_id INTEGER,
+  variant_strategy TEXT DEFAULT '',
+  variant_params TEXT DEFAULT '{}',
+  lineage_json TEXT DEFAULT '{}',
+  thesis_json TEXT DEFAULT '{}',
   fingerprint TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -87,6 +92,10 @@ CREATE TABLE IF NOT EXISTS gate_checks (
   prod_corr_check TEXT,
   weight_check TEXT,
   subuniverse_check TEXT,
+  gate_status TEXT DEFAULT 'complete',
+  error_type TEXT DEFAULT '',
+  incomplete_checks TEXT DEFAULT '',
+  error TEXT DEFAULT '',
   passed INTEGER NOT NULL DEFAULT 0,
   raw_json TEXT,
   created_at TEXT NOT NULL
@@ -122,6 +131,15 @@ class Repository:
         self._ensure_column("sim_results", "diagnosis_json", "TEXT")
         self._ensure_column("candidates", "selection_score", "REAL DEFAULT 0")
         self._ensure_column("candidates", "score_breakdown", "TEXT DEFAULT '{}'")
+        self._ensure_column("candidates", "parent_candidate_id", "INTEGER")
+        self._ensure_column("candidates", "variant_strategy", "TEXT DEFAULT ''")
+        self._ensure_column("candidates", "variant_params", "TEXT DEFAULT '{}'")
+        self._ensure_column("candidates", "lineage_json", "TEXT DEFAULT '{}'")
+        self._ensure_column("candidates", "thesis_json", "TEXT DEFAULT '{}'")
+        self._ensure_column("gate_checks", "gate_status", "TEXT DEFAULT 'complete'")
+        self._ensure_column("gate_checks", "error_type", "TEXT DEFAULT ''")
+        self._ensure_column("gate_checks", "incomplete_checks", "TEXT DEFAULT ''")
+        self._ensure_column("gate_checks", "error", "TEXT DEFAULT ''")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
@@ -213,21 +231,50 @@ class Repository:
         idea_file: str = "",
         alpha_id: str = "",
         source: str = "",
+        parent_candidate_id: int | None = None,
+        variant_strategy: str = "",
+        variant_params: dict[str, Any] | None = None,
+        lineage: dict[str, Any] | None = None,
+        thesis: dict[str, Any] | None = None,
     ) -> int:
         ts = now_iso()
         self.conn.execute(
             """
-            INSERT INTO candidates(run_id, expression, idea_file, alpha_id, status, source, fingerprint, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO candidates(
+              run_id, expression, idea_file, alpha_id, status, source,
+              parent_candidate_id, variant_strategy, variant_params, lineage_json, thesis_json,
+              fingerprint, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, fingerprint) DO UPDATE SET
               expression=excluded.expression,
               idea_file=COALESCE(NULLIF(excluded.idea_file, ''), candidates.idea_file),
               alpha_id=COALESCE(NULLIF(excluded.alpha_id, ''), candidates.alpha_id),
               status=excluded.status,
               source=COALESCE(NULLIF(excluded.source, ''), candidates.source),
+              parent_candidate_id=COALESCE(excluded.parent_candidate_id, candidates.parent_candidate_id),
+              variant_strategy=COALESCE(NULLIF(excluded.variant_strategy, ''), candidates.variant_strategy),
+              variant_params=COALESCE(NULLIF(excluded.variant_params, '{}'), candidates.variant_params),
+              lineage_json=COALESCE(NULLIF(excluded.lineage_json, '{}'), candidates.lineage_json),
+              thesis_json=COALESCE(NULLIF(excluded.thesis_json, '{}'), candidates.thesis_json),
               updated_at=excluded.updated_at
             """,
-            (run_id, expression, idea_file, alpha_id, status, source, fingerprint, ts, ts),
+            (
+                run_id,
+                expression,
+                idea_file,
+                alpha_id,
+                status,
+                source,
+                parent_candidate_id,
+                variant_strategy,
+                json.dumps(variant_params or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(lineage or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(thesis or {}, ensure_ascii=False, sort_keys=True),
+                fingerprint,
+                ts,
+                ts,
+            ),
         )
         row = self.conn.execute(
             "SELECT candidate_id FROM candidates WHERE run_id = ? AND fingerprint = ?", (run_id, fingerprint)
@@ -322,8 +369,9 @@ class Repository:
             """
             INSERT INTO gate_checks(
               run_id, candidate_id, alpha_id, submission_check, self_corr_check, prod_corr_check,
-              weight_check, subuniverse_check, passed, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              weight_check, subuniverse_check, gate_status, error_type, incomplete_checks, error,
+              passed, raw_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -334,6 +382,10 @@ class Repository:
                 result.get("prod_corr_check", ""),
                 result.get("weight_check", ""),
                 result.get("subuniverse_check", ""),
+                result.get("gate_status", "complete"),
+                result.get("error_type", ""),
+                ",".join(result.get("incomplete_checks") or []),
+                result.get("error", ""),
                 1 if result.get("passed") else 0,
                 json.dumps(result, ensure_ascii=False),
                 now_iso(),
@@ -373,6 +425,16 @@ class Repository:
             rows = self.conn.execute(f"SELECT * FROM {table} WHERE run_id = ? ORDER BY 1", (run_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def find_candidates_by_status(self, run_id: str, statuses: list[str]) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self.conn.execute(
+            f"SELECT * FROM candidates WHERE run_id = ? AND status IN ({placeholders}) ORDER BY candidate_id",
+            (run_id, *statuses),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_artifacts(self, run_id: str, kind: str | None = None, source_stage: str | None = None) -> list[dict[str, Any]]:
         clauses = ["run_id = ?"]
         params: list[Any] = [run_id]
@@ -396,3 +458,17 @@ class Repository:
         else:
             row = self.conn.execute("SELECT COUNT(*) AS n FROM candidates WHERE run_id = ?", (run_id,)).fetchone()
         return int(row["n"])
+
+    def count_sim_results_by_candidate(self, run_id: str) -> dict[int, int]:
+        rows = self.conn.execute(
+            "SELECT candidate_id, COUNT(*) AS cnt FROM sim_results WHERE run_id = ? AND candidate_id IS NOT NULL GROUP BY candidate_id",
+            (run_id,),
+        ).fetchall()
+        return {int(row["candidate_id"]): int(row["cnt"]) for row in rows}
+
+    def count_retryable_sim_results_by_candidate(self, run_id: str) -> dict[int, int]:
+        rows = self.conn.execute(
+            "SELECT candidate_id, COUNT(*) AS cnt FROM sim_results WHERE run_id = ? AND candidate_id IS NOT NULL AND failure_tags LIKE '%sim_retryable%' GROUP BY candidate_id",
+            (run_id,),
+        ).fetchall()
+        return {int(row["candidate_id"]): int(row["cnt"]) for row in rows}

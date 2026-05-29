@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .diagnostics import is_retryable_sim_failure
 from .models import CandidateStatus
 
 
@@ -16,6 +17,8 @@ def classify_candidate(
 ) -> CandidateStatus:
     if gate_passed:
         return CandidateStatus.SUBMIT_READY
+    if is_retryable_sim_failure(status=sim_status, error=hard_error):
+        return CandidateStatus.SIM_RETRYABLE
     if hard_error:
         return CandidateStatus.REJECTED
     if sim_status and sim_status.upper() not in {"COMPLETE", "COMPLETED", "SUCCESS"}:

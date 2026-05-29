@@ -119,10 +119,10 @@ class DecisionEngine:
             creds = load_credentials(require_brain=False, require_llm=True)
             payload = _build_llm_payload(candidates, self.max_actions, creds, self.prompt_version)
             req = urllib.request.Request(
-                url=creds["moonshot_base_url"].rstrip("/") + "/chat/completions",
+                url=creds["llm_base_url"].rstrip("/") + "/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={
-                    "Authorization": f"Bearer {creds['moonshot_api_key']}",
+                    "Authorization": f"Bearer {creds['llm_api_key']}",
                     "Content-Type": "application/json",
                 },
                 method="POST",
@@ -226,7 +226,7 @@ def _build_llm_payload(
         "candidate_ids array, reason string. Do not mark submit readiness."
     )
     return {
-        "model": os.environ.get("MOONSHOT_MODEL") or creds.get("moonshot_model", "kimi-k2.5"),
+        "model": os.environ.get("LLM_MODEL") or os.environ.get("MOONSHOT_MODEL") or creds.get("llm_model", "kimi-k2.5"),
         "messages": [
             {"role": "system", "content": system},
             {

@@ -9,6 +9,7 @@ class CandidateStatus(StrEnum):
     GENERATED = "generated"
     SIM_PENDING = "sim_pending"
     SIM_FAILED = "sim_failed"
+    SIM_RETRYABLE = "sim_retryable"
     PROMISING = "promising"
     NEEDS_ENHANCE = "needs_enhance"
     SUBMIT_READY = "submit_ready"
@@ -22,6 +23,7 @@ class RunStage(StrEnum):
     INSPECT = "INSPECT"
     SIMULATE = "SIMULATE"
     DECIDE = "DECIDE"
+    VARIANT_SEARCH = "VARIANT_SEARCH"
     ENHANCE = "ENHANCE"
     SUBMIT_GATE = "SUBMIT_GATE"
     REPORT = "REPORT"
@@ -42,12 +44,14 @@ class RunConfig:
     max_trade: bool = False
     target_ready: int = 4
     max_iterations: int = 6
-    batch_size: int = 5
-    concurrency: int = 4
+    batch_size: int = 10
+    concurrency: int = 8
     dry_run: bool = False
     max_fields: int | None = None
     max_operators: int | None = None
     max_sim_alphas: int | None = None
+    max_variant_alphas: int = 20
+    max_variants_per_alpha: int = 4
     use_llm_decide: bool = False
     max_enhance_actions: int = 4
     make_prompt_version: str = "make-v1"
@@ -74,6 +78,8 @@ class RunConfig:
             "max_fields": self.max_fields,
             "max_operators": self.max_operators,
             "max_sim_alphas": self.max_sim_alphas,
+            "max_variant_alphas": self.max_variant_alphas,
+            "max_variants_per_alpha": self.max_variants_per_alpha,
             "use_llm_decide": self.use_llm_decide,
             "max_enhance_actions": self.max_enhance_actions,
             "make_prompt_version": self.make_prompt_version,

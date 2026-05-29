@@ -4,6 +4,12 @@
 # Keep repository metadata and public documentation.
 !/.gitignore
 !/README.md
+!/AGENTS.md
+!/CLAUDE.md
+!/CODEX_CONTEXT.md
+!/codex_pipeline.md
+!/brain_python_alpha_notes.md
+!/brain_python_alpha_update_plan.md
 
 # Publish the root-level Python package files.
 !/__init__.py
@@ -19,13 +25,21 @@
 !/memory.py
 !/models.py
 !/prompting.py
+!/progress.py
+!/quality.py
+!/quota_allocator.py
+!/optimizers.py
 !/reporting.py
 !/repository.py
 !/runtime.py
 !/scoring.py
 !/selection.py
 !/task_runner.py
+!/thesis.py
 !/utils.py
+!/variant_search.py
+!/tests/
+!/tests/test_brain_agent.py
 
 # Local/private material stays out of GitHub.
 .env

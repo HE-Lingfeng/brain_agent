@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -12,18 +13,44 @@ from .credentials import load_credentials
 from .forum import DEFAULT_DAILY_LEARNING_QUERIES, ForumService, render_markdown
 from .knowledge import approve_forum_lesson
 from .memory import AlphaMemory, render_memory_summary_markdown
-from .models import RunConfig
+from .models import CandidateStatus, RunConfig
 from .prompting import (
     compare_prompt_runs,
     render_prompt_compare_markdown,
     summarize_run_prompt_metrics,
     write_prompt_compare_report,
 )
+from .progress import build_simulation_progress, render_simulation_progress
+from .quality import build_research_quality_summary, render_research_quality_markdown
 from .reporting import build_run_result, write_report
 from .repository import Repository
 from .runtime import ensure_runtime, get_runtime_paths, new_run_id
+from .settings_presets import (
+    SETTING_KEYS,
+    find_settings_preset,
+    load_settings_presets,
+    prompt_dataset,
+    render_preset_detail,
+    render_settings_presets,
+    parse_bool as parse_settings_bool,
+    select_settings_preset,
+    settings_command_fragment,
+)
 from .task_runner import TaskRunner
 from .utils import write_json
+from .worker import SimulationWorker
+
+
+def _simulation_slot_policy(region: str) -> dict[str, int]:
+    """Return the default BRAIN simulation slot policy for a region."""
+    region_norm = str(region or "").upper()
+    concurrency = 4 if region_norm == "GLB" else 8
+    batch_size = 4 if region_norm == "GLB" else 10
+    return {
+        "batch_size": batch_size,
+        "concurrency": concurrency,
+        "capacity": batch_size * concurrency,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     run_p = sub.add_parser("run")
     _add_config_args(run_p)
     run_p.add_argument("--run-id")
+    run_p.add_argument("--preset", default=None, help="Named dataset/settings preset")
+    run_p.add_argument("--choose-settings", action="store_true", help="Interactively choose a dataset/settings preset")
     run_p.add_argument("--dry-run", action="store_true")
 
     status_p = sub.add_parser("status")
@@ -41,6 +70,25 @@ def main(argv: list[str] | None = None) -> int:
 
     resume_p = sub.add_parser("resume")
     resume_p.add_argument("--run-id", required=True)
+
+    retry_sim_p = sub.add_parser("retry-sim")
+    retry_sim_p.add_argument("--run-id", required=True)
+    retry_sim_p.add_argument("--limit", type=int, default=None, help="Maximum retryable candidates to resimulate")
+    retry_sim_p.add_argument("--batch-size", type=int, default=None)
+    retry_sim_p.add_argument("--concurrency", type=int, default=None)
+    retry_sim_p.add_argument("--dry-run", action="store_true", help="Write retry alpha_list and print summary without submitting")
+
+    worker_p = sub.add_parser("worker")
+    worker_p.add_argument("--run-id", required=True)
+    worker_p.add_argument("--mode", choices=["drain", "once"], default="drain")
+    worker_p.add_argument("--idle-sleep-seconds", type=int, default=60, help="Poll interval when queue is empty")
+    worker_p.add_argument("--max-runtime-hours", type=float, default=None, help="Auto-shutdown after N hours")
+    worker_p.add_argument("--max-batches", type=int, default=None, help="Stop after N batches")
+    worker_p.add_argument("--max-total-alphas", type=int, default=5000, help="Stop after submitting N alphas total (default 5000, the BRAIN daily limit)")
+    worker_p.add_argument("--max-retries", type=int, default=3, help="Max retries per candidate before marking SIM_FAILED")
+    worker_p.add_argument("--batch-candidates-limit", type=int, default=0, help="Max candidates per batch (0 = batch_size * concurrency)")
+    worker_p.add_argument("--batch-size", type=int, default=None, help="Override batch_size from run config")
+    worker_p.add_argument("--concurrency", type=int, default=None, help="Override concurrency from run config")
 
     report_p = sub.add_parser("report")
     report_p.add_argument("--run-id", required=True)
@@ -69,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
 
     forum_search = forum_sub.add_parser("search")
     forum_search.add_argument("query")
-    forum_search.add_argument("--max-results", type=int, default=20)
+    forum_search.add_argument("--max-results", type=int, default=50)
     forum_search.add_argument("--locale", default="zh-cn")
     forum_search.add_argument("--format", choices=["json", "markdown"], default="json")
 
@@ -123,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     prompt_p = sub.add_parser("prompt")
     prompt_sub = prompt_p.add_subparsers(dest="prompt_command", required=True)
     prompt_compare = prompt_sub.add_parser("compare")
-    prompt_compare.add_argument("--run-id", action="append", dest="run_ids", required=True)
+    prompt_compare.add_argument("--run-id", action="append", dest="run_ids", required=True, help="Compare runs; the first run id is treated as the baseline/control")
     prompt_compare.add_argument("--format", choices=["json", "markdown"], default="markdown")
     prompt_compare.add_argument("--output", default=None)
 
@@ -137,6 +185,26 @@ def main(argv: list[str] | None = None) -> int:
     memory_summary.add_argument("--limit", type=int, default=10)
     memory_summary.add_argument("--format", choices=["json", "markdown"], default="markdown")
 
+    research_p = sub.add_parser("research")
+    research_sub = research_p.add_subparsers(dest="research_command", required=True)
+    research_summary = research_sub.add_parser("summary")
+    research_summary.add_argument("--run-id", action="append", dest="run_ids")
+    research_summary.add_argument("--dataset", default=None)
+    research_summary.add_argument("--region", default=None)
+    research_summary.add_argument("--limit", type=int, default=20)
+    research_summary.add_argument("--format", choices=["json", "markdown"], default="markdown")
+    research_summary.add_argument("--output", default=None)
+
+    settings_p = sub.add_parser("settings")
+    settings_sub = settings_p.add_subparsers(dest="settings_command", required=True)
+    settings_list = settings_sub.add_parser("list")
+    settings_list.add_argument("--format", choices=["table", "json"], default="table")
+    settings_show = settings_sub.add_parser("show")
+    settings_show.add_argument("--preset", required=True)
+    settings_show.add_argument("--format", choices=["text", "json"], default="text")
+    settings_choose = settings_sub.add_parser("choose")
+    settings_choose.add_argument("--print-command", action="store_true", help="Print a run command using the chosen preset")
+
     parse_p = sub.add_parser("parse-artifact")
     parse_p.add_argument("--run-id", required=True)
     parse_p.add_argument("--kind", choices=["final_expressions", "alpha_list", "simulation_status"], required=True)
@@ -149,6 +217,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(args)
     if args.command == "resume":
         return cmd_resume(args)
+    if args.command == "retry-sim":
+        return cmd_retry_sim(args)
+    if args.command == "worker":
+        return cmd_worker(args)
     if args.command == "report":
         return cmd_report(args)
     if args.command == "export":
@@ -167,21 +239,25 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_prompt(args)
     if args.command == "memory":
         return cmd_memory(args)
+    if args.command == "research":
+        return cmd_research(args)
+    if args.command == "settings":
+        return cmd_settings(args)
     if args.command == "parse-artifact":
         return cmd_parse_artifact(args)
     return 2
 
 
 def _add_config_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset", required=True)
-    parser.add_argument("--region", required=True)
-    parser.add_argument("--delay", type=int, required=True)
-    parser.add_argument("--universe", required=True)
-    parser.add_argument("--data-type", required=True)
-    parser.add_argument("--decay", type=int, default=10)
-    parser.add_argument("--truncation", type=float, default=0.08)
-    parser.add_argument("--neutralization", default="INDUSTRY")
-    parser.add_argument("--max-trade", type=_parse_bool, default=False)
+    parser.add_argument("--dataset")
+    parser.add_argument("--region")
+    parser.add_argument("--delay", type=int)
+    parser.add_argument("--universe")
+    parser.add_argument("--data-type")
+    parser.add_argument("--decay", type=int)
+    parser.add_argument("--truncation", type=float)
+    parser.add_argument("--neutralization")
+    parser.add_argument("--max-trade", type=_parse_bool)
     parser.add_argument("--target-ready", type=int, default=4)
     parser.add_argument("--max-iterations", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -189,6 +265,8 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-fields", type=int, default=None)
     parser.add_argument("--max-operators", type=int, default=None)
     parser.add_argument("--max-sim-alphas", type=int, default=None)
+    parser.add_argument("--max-variant-alphas", type=int, default=20)
+    parser.add_argument("--max-variants-per-alpha", type=int, default=4)
     parser.add_argument("--use-llm-decide", action="store_true")
     parser.add_argument("--max-enhance-actions", type=int, default=4)
     parser.add_argument("--make-prompt-version", default="make-v1")
@@ -209,27 +287,33 @@ def _parse_bool(value: str | bool) -> bool:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    region = str(args.region).upper()
-    default_batch_size = 4 if region == "GLB" else 5
-    default_concurrency = 2 if region == "GLB" else 4
+    try:
+        settings = _resolve_run_settings(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    region = str(settings["region"]).upper()
+    slot_policy = _simulation_slot_policy(region)
     config = RunConfig(
-        dataset=args.dataset,
+        dataset=settings["dataset"],
         region=region,
-        delay=args.delay,
-        universe=args.universe,
-        data_type=str(args.data_type).upper(),
-        decay=args.decay,
-        truncation=args.truncation,
-        neutralization=str(args.neutralization).upper(),
-        max_trade=bool(args.max_trade),
+        delay=settings["delay"],
+        universe=settings["universe"],
+        data_type=str(settings["data_type"]).upper(),
+        decay=settings["decay"],
+        truncation=settings["truncation"],
+        neutralization=str(settings["neutralization"]).upper(),
+        max_trade=bool(settings["max_trade"]),
         target_ready=args.target_ready,
         max_iterations=args.max_iterations,
-        batch_size=args.batch_size if args.batch_size is not None else default_batch_size,
-        concurrency=args.concurrency if args.concurrency is not None else default_concurrency,
+        batch_size=args.batch_size if args.batch_size is not None else slot_policy["batch_size"],
+        concurrency=args.concurrency if args.concurrency is not None else slot_policy["concurrency"],
         dry_run=args.dry_run,
         max_fields=args.max_fields,
         max_operators=args.max_operators,
         max_sim_alphas=args.max_sim_alphas,
+        max_variant_alphas=args.max_variant_alphas,
+        max_variants_per_alpha=args.max_variants_per_alpha,
         use_llm_decide=args.use_llm_decide,
         max_enhance_actions=args.max_enhance_actions,
         make_prompt_version=args.make_prompt_version,
@@ -258,6 +342,57 @@ def cmd_run(args: argparse.Namespace) -> int:
         repo.close()
 
 
+def _resolve_run_settings(args: argparse.Namespace) -> dict[str, object]:
+    settings: dict[str, object] = {}
+    if args.preset and args.choose_settings:
+        raise ValueError("Use either --preset or --choose-settings, not both.")
+    if args.choose_settings:
+        preset = select_settings_preset(args.runtime_root)
+        settings.update(preset.normalized_settings())
+        if not args.dataset and "dataset" not in settings:
+            settings["dataset"] = prompt_dataset()
+    elif args.preset:
+        settings.update(find_settings_preset(args.preset, args.runtime_root).normalized_settings())
+
+    cli_values = {
+        "dataset": args.dataset,
+        "region": args.region,
+        "delay": args.delay,
+        "universe": args.universe,
+        "data_type": args.data_type,
+        "decay": args.decay,
+        "truncation": args.truncation,
+        "neutralization": args.neutralization,
+        "max_trade": args.max_trade,
+    }
+    for key, value in cli_values.items():
+        if value is not None:
+            settings[key] = value
+
+    settings.setdefault("decay", 10)
+    settings.setdefault("truncation", 0.08)
+    settings.setdefault("neutralization", "INDUSTRY")
+    settings.setdefault("max_trade", False)
+
+    missing = [key for key in SETTING_KEYS if key not in settings or settings[key] in {None, ""}]
+    if missing:
+        missing_flags = ", ".join("--" + key.replace("_", "-") for key in missing)
+        raise ValueError(
+            f"Missing settings: {missing_flags}. Use --dataset with --preset, use --choose-settings, or pass the settings explicitly."
+        )
+
+    settings["dataset"] = str(settings["dataset"])
+    settings["region"] = str(settings["region"]).upper()
+    settings["delay"] = int(settings["delay"])
+    settings["universe"] = str(settings["universe"]).upper()
+    settings["data_type"] = str(settings["data_type"]).upper()
+    settings["decay"] = int(settings["decay"])
+    settings["truncation"] = float(settings["truncation"])
+    settings["neutralization"] = str(settings["neutralization"]).upper()
+    settings["max_trade"] = parse_settings_bool(settings["max_trade"])
+    return settings
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     paths = get_runtime_paths(args.run_id, args.runtime_root)
     repo = Repository(paths.db_path)
@@ -266,8 +401,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if not run:
             print(f"Run not found: {args.run_id}", file=sys.stderr)
             return 1
-        print(json.dumps(
-            {
+        progress = build_simulation_progress(repo, args.run_id, paths.run_dir)
+        payload = {
                 "run_id": args.run_id,
                 "stage": run["stage"],
                 "stop_reason": run["stop_reason"],
@@ -278,7 +413,16 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "needs_enhance": repo.count_candidates(args.run_id, "needs_enhance"),
                 },
                 "run_dir": str(paths.run_dir),
-            },
+                "simulation": progress,
+            }
+        worker_stats_path = paths.run_dir / "worker_stats" / "worker_stats.json"
+        if worker_stats_path.exists():
+            try:
+                payload["worker_stats"] = json.loads(worker_stats_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        print(json.dumps(
+            payload,
             ensure_ascii=False,
             indent=2,
         ))
@@ -296,6 +440,104 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print(f"run_id: {args.run_id}")
         print(f"stop_reason: {reason}")
         return 0
+    finally:
+        repo.close()
+
+
+def cmd_retry_sim(args: argparse.Namespace) -> int:
+    paths = get_runtime_paths(args.run_id, args.runtime_root)
+    ensure_runtime(paths)
+    repo = Repository(paths.db_path)
+    try:
+        run = repo.get_run(args.run_id)
+        if not run:
+            print(f"Run not found: {args.run_id}", file=sys.stderr)
+            return 1
+        config = RunConfig(**json.loads(run["config_json"]))
+        if args.batch_size is not None or args.concurrency is not None:
+            config = replace(
+                config,
+                batch_size=args.batch_size if args.batch_size is not None else config.batch_size,
+                concurrency=args.concurrency if args.concurrency is not None else config.concurrency,
+            )
+        candidates = [
+            row
+            for row in repo.list_rows("candidates", args.run_id)
+            if row.get("status") == CandidateStatus.SIM_RETRYABLE.value
+        ]
+        candidates.sort(key=lambda row: (float(row.get("selection_score") or 0), int(row.get("candidate_id") or 0)), reverse=True)
+        if args.limit is not None:
+            candidates = candidates[: max(0, int(args.limit))]
+        inspect = InspectRawTemplateAdapter(repo, args.run_id, paths.run_dir)
+        alpha_list = inspect.write_alpha_list_for_candidates(
+            candidates,
+            config,
+            name="alpha_list_retryable.json",
+        )
+        payload = {
+            "run_id": args.run_id,
+            "retryable_count": len(candidates),
+            "alpha_list": str(alpha_list),
+            "submitted": False,
+        }
+        if candidates and not args.dry_run:
+            retry_config = replace(config, max_sim_alphas=None)
+            result = BatchSimAdapter(repo, args.run_id, paths.run_dir).run_real(alpha_list, retry_config)
+            payload["submitted"] = result.status == "ok"
+            payload["status"] = result.status
+            payload["error_summary"] = result.error_summary
+            payload["metrics_count"] = len(result.metrics_delta)
+            if result.status != "ok":
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                return 1
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        repo.close()
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    paths = get_runtime_paths(args.run_id, args.runtime_root)
+    ensure_runtime(paths)
+    repo = Repository(paths.db_path)
+    try:
+        run = repo.get_run(args.run_id)
+        if not run:
+            print(f"Run not found: {args.run_id}", file=sys.stderr)
+            return 1
+        config = RunConfig(**json.loads(run["config_json"]))
+        slot_policy = _simulation_slot_policy(config.region)
+        if args.batch_size is not None:
+            config = replace(config, batch_size=args.batch_size)
+        elif config.batch_size != slot_policy["batch_size"]:
+            config = replace(config, batch_size=slot_policy["batch_size"])
+        if args.concurrency is not None:
+            config = replace(config, concurrency=args.concurrency)
+        elif config.concurrency != slot_policy["concurrency"]:
+            config = replace(config, concurrency=slot_policy["concurrency"])
+        config = replace(config, max_sim_alphas=None)
+
+        limit = int(args.batch_candidates_limit)
+        if limit <= 0:
+            limit = max(config.batch_size * config.concurrency, 1)
+
+        worker = SimulationWorker(repo, args.run_id, paths, config)
+
+        if args.mode == "once":
+            stats = worker.run_once(max_retries=args.max_retries, max_candidates_per_batch=limit)
+        else:
+            stats = worker.run_drain(
+                idle_sleep=args.idle_sleep_seconds,
+                max_runtime_hours=args.max_runtime_hours,
+                max_batches=args.max_batches,
+                max_total_alphas=args.max_total_alphas,
+                max_retries=args.max_retries,
+                max_candidates_per_batch=limit,
+            )
+
+        if stats.total_submitted == 0:
+            return 0
+        return 0 if stats.total_succeeded > 0 else 1
     finally:
         repo.close()
 
@@ -527,6 +769,93 @@ def cmd_memory(args: argparse.Namespace) -> int:
         memory.close()
 
 
+def cmd_research(args: argparse.Namespace) -> int:
+    if args.research_command != "summary":
+        print(f"Unknown research command: {args.research_command}", file=sys.stderr)
+        return 2
+    try:
+        runtime_root = get_runtime_paths("_research", args.runtime_root).root
+        summary = build_research_quality_summary(
+            runtime_root,
+            run_ids=args.run_ids,
+            dataset=str(args.dataset) if args.dataset else None,
+            region=str(args.region).upper() if args.region else None,
+            limit=int(args.limit),
+        )
+    except Exception as exc:
+        print(f"research summary failed: {exc}", file=sys.stderr)
+        return 1
+    if args.format == "json":
+        text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+    else:
+        text = render_research_quality_markdown(summary)
+    if args.output:
+        out = Path(args.output).expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(str(out))
+    else:
+        print(text, end="")
+    return 0
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    if args.settings_command == "list":
+        presets = load_settings_presets(args.runtime_root)
+        if args.format == "json":
+            payload = [
+                {
+                    "name": preset.name,
+                    "description": preset.description,
+                    "source": preset.source,
+                    "settings": preset.normalized_settings(),
+                }
+                for preset in presets
+            ]
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(render_settings_presets(presets))
+        return 0
+
+    if args.settings_command == "show":
+        try:
+            preset = find_settings_preset(args.preset, args.runtime_root)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "name": preset.name,
+                        "description": preset.description,
+                        "source": preset.source,
+                        "settings": preset.normalized_settings(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(render_preset_detail(preset))
+        return 0
+
+    if args.settings_command == "choose":
+        try:
+            preset = select_settings_preset(args.runtime_root)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(render_preset_detail(preset))
+        if args.print_command:
+            print()
+            print(f"PYTHONPATH=.. python3 -m brain_agent run --dataset <dataset_id> --preset {preset.name}")
+            print(f"# explicit settings: {settings_command_fragment(preset.normalized_settings())}")
+        return 0
+
+    return 2
+
+
 def cmd_tasks(args: argparse.Namespace) -> int:
     paths = get_runtime_paths(args.run_id, args.runtime_root)
     repo = Repository(paths.db_path)
@@ -565,6 +894,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
                 if status != row.get("status"):
                     repo.update_task_status(str(row["task_id"]), status)
                     row["status"] = status
+        if any(str(row.get("adapter") or "") == "batchSim" for row in rows):
+            print(render_simulation_progress(build_simulation_progress(repo, args.run_id, paths.run_dir)))
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
     finally:
@@ -626,12 +957,22 @@ def _credential_env_for_retry() -> dict[str, str]:
     if creds.get("brain_password"):
         env["BRAIN_PASSWORD"] = creds["brain_password"]
         env["BRAIN_CREDENTIAL_PASSWORD"] = creds["brain_password"]
-    if creds.get("moonshot_api_key"):
-        env["MOONSHOT_API_KEY"] = creds["moonshot_api_key"]
-    if creds.get("moonshot_base_url"):
-        env["MOONSHOT_BASE_URL"] = creds["moonshot_base_url"]
-    if creds.get("moonshot_model"):
-        env["MOONSHOT_MODEL"] = creds["moonshot_model"]
+    if creds.get("llm_provider"):
+        env["BRAIN_LLM_PROVIDER"] = creds["llm_provider"]
+        env["LLM_PROVIDER"] = creds["llm_provider"]
+    if creds.get("llm_api_key"):
+        env["LLM_API_KEY"] = creds["llm_api_key"]
+        env["MOONSHOT_API_KEY"] = creds["llm_api_key"]
+        if creds.get("llm_provider") == "deepseek":
+            env["DEEPSEEK_API_KEY"] = creds["llm_api_key"]
+        if creds.get("llm_provider") == "openai":
+            env["OPENAI_API_KEY"] = creds["llm_api_key"]
+    if creds.get("llm_base_url"):
+        env["LLM_BASE_URL"] = creds["llm_base_url"]
+        env["MOONSHOT_BASE_URL"] = creds["llm_base_url"]
+    if creds.get("llm_model"):
+        env["LLM_MODEL"] = creds["llm_model"]
+        env["MOONSHOT_MODEL"] = creds["llm_model"]
     return env
 
 
@@ -645,13 +986,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:
         checks.append({"name": "runtime_writable", "ok": False, "detail": str(exc)})
 
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parent
     required = [
-        repo_root / ".claude" / "skills" / "brain-makeSomeGem" / "scripts" / "headless_runner" / "run.py",
-        repo_root / ".claude" / "skills" / "brain-inspectRawTemplate-create-Setting" / "scripts" / "process_template.py",
-        repo_root / ".claude" / "skills" / "brain-simAlphasinBatch-and-track" / "scripts" / "batch_simulator.py",
-        repo_root / ".claude" / "skills" / "brain-enhance-template" / "scripts" / "run.py",
-        repo_root / ".claude" / "skills" / "brain-shared" / "scripts" / "ace_lib.py",
+        repo_root / ".agents" / "skills" / "brain-makeSomeGem" / "scripts" / "headless_runner" / "run.py",
+        repo_root / ".agents" / "skills" / "brain-inspectRawTemplate-create-Setting" / "scripts" / "process_template.py",
+        repo_root / ".agents" / "skills" / "brain-simAlphasinBatch-and-track" / "scripts" / "batch_simulator.py",
+        repo_root / ".agents" / "skills" / "brain-enhance-template" / "scripts" / "run.py",
+        repo_root / ".agents" / "skills" / "brain-shared" / "scripts" / "ace_lib.py",
     ]
     for path in required:
         checks.append({"name": f"exists:{path.name}", "ok": path.exists(), "detail": str(path)})
@@ -660,7 +1001,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         creds = load_credentials(require_brain=True, require_llm=bool(args.check_llm))
         checks.append({"name": "brain_credentials", "ok": bool(creds.get("brain_email") and creds.get("brain_password")), "detail": "loaded"})
         if args.check_llm:
-            checks.append({"name": "llm_credentials", "ok": bool(creds.get("moonshot_api_key")), "detail": "loaded"})
+            checks.append(
+                {
+                    "name": "llm_credentials",
+                    "ok": bool(creds.get("llm_api_key")),
+                    "detail": f"provider={creds.get('llm_provider', '')} model={creds.get('llm_model', '')}",
+                }
+            )
     except Exception as exc:
         checks.append({"name": "credentials", "ok": False, "detail": str(exc)})
 

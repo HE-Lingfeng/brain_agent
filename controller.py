@@ -9,6 +9,7 @@ from .adapters import (
     InspectRawTemplateAdapter,
     MakeSomeGemAdapter,
     SubmissionGateAdapter,
+    VariantSearchAdapter,
 )
 from .decision import DecisionEngine
 from .memory import AlphaMemory, memory_path_for_run_dir
@@ -26,56 +27,68 @@ class BatchLoopController:
         self.paths = paths
 
     def run(self, config: RunConfig, *, resume: bool = False) -> str:
-        if not config.dry_run:
-            return self._run_real(config, resume=resume)
+        try:
+            if not config.dry_run:
+                return self._run_real(config, resume=resume)
 
-        for iteration in range(1, config.max_iterations + 1):
-            self.repo.update_run_stage(self.run_id, RunStage.GENERATE.value)
-            MakeSomeGemAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run(config)
+            for iteration in range(1, config.max_iterations + 1):
+                self.repo.update_run_stage(self.run_id, RunStage.GENERATE.value)
+                MakeSomeGemAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run(config)
 
-            self.repo.update_run_stage(self.run_id, RunStage.INSPECT.value)
-            InspectRawTemplateAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run(config)
+                self.repo.update_run_stage(self.run_id, RunStage.INSPECT.value)
+                InspectRawTemplateAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run(config)
 
-            self.repo.update_run_stage(self.run_id, RunStage.SIMULATE.value)
-            BatchSimAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run()
-
-            ready = self.repo.count_candidates(self.run_id, CandidateStatus.SUBMIT_READY.value)
-            if ready >= config.target_ready:
-                return self._finish(f"target_ready reached before gate: {ready}")
-
-            self.repo.update_run_stage(self.run_id, RunStage.DECIDE.value)
-            enhance_inputs = self._enhance_inputs()
-            actions = DecisionEngine(
-                max_actions=config.max_enhance_actions,
-                use_llm=config.use_llm_decide,
-                prompt_version=config.decision_prompt_version,
-            ).decide(enhance_inputs)
-            if actions:
-                source = "LLM" if any(a.source == "llm" for a in actions) else "Rule-based"
-                self.repo.add_decision(
-                    self.run_id,
-                    iteration,
-                    json.dumps([a.to_dict() for a in actions], ensure_ascii=False),
-                    f"{source} dry-run enhancement selection; hard gate checks remain authoritative.",
-                    enhance_inputs,
+                self.repo.update_run_stage(self.run_id, RunStage.SIMULATE.value)
+                BatchSimAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run()
+                self.repo.update_run_stage(self.run_id, RunStage.VARIANT_SEARCH.value)
+                VariantSearchAdapter(self.repo, self.run_id, self.paths.run_dir).run(
+                    self._latest_artifact_path(kind="alpha_list_combined", stage="INSPECT")
+                    or self.paths.artifacts_dir / "02_inspect" / "alpha_list.json",
+                    config,
+                    iteration=iteration,
                 )
 
-            self.repo.update_run_stage(self.run_id, RunStage.ENHANCE.value)
-            if enhance_inputs:
-                EnhanceTemplateAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run(limit=2)
+                ready = self.repo.count_candidates(self.run_id, CandidateStatus.SUBMIT_READY.value)
+                if ready >= config.target_ready:
+                    return self._finish(f"target_ready reached before gate: {ready}")
 
-            self.repo.update_run_stage(self.run_id, RunStage.SIMULATE.value)
-            BatchSimAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run()
+                self.repo.update_run_stage(self.run_id, RunStage.DECIDE.value)
+                enhance_inputs = self._enhance_inputs()
+                actions = DecisionEngine(
+                    max_actions=config.max_enhance_actions,
+                    use_llm=config.use_llm_decide,
+                    prompt_version=config.decision_prompt_version,
+                ).decide(enhance_inputs)
+                if actions:
+                    source = "LLM" if any(a.source == "llm" for a in actions) else "Rule-based"
+                    self.repo.add_decision(
+                        self.run_id,
+                        iteration,
+                        json.dumps([a.to_dict() for a in actions], ensure_ascii=False),
+                        f"{source} dry-run enhancement selection; hard gate checks remain authoritative.",
+                        enhance_inputs,
+                    )
 
-            self.repo.update_run_stage(self.run_id, RunStage.SUBMIT_GATE.value)
-            SubmissionGateAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run()
+                self.repo.update_run_stage(self.run_id, RunStage.ENHANCE.value)
+                if enhance_inputs:
+                    EnhanceTemplateAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run(limit=2)
+
+                self.repo.update_run_stage(self.run_id, RunStage.SIMULATE.value)
+                BatchSimAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run()
+
+                self.repo.update_run_stage(self.run_id, RunStage.SUBMIT_GATE.value)
+                SubmissionGateAdapter(self.repo, self.run_id, self.paths.run_dir).dry_run()
+
+                ready = self.repo.count_candidates(self.run_id, CandidateStatus.SUBMIT_READY.value)
+                if ready >= config.target_ready:
+                    return self._finish(f"target_ready reached: {ready}")
 
             ready = self.repo.count_candidates(self.run_id, CandidateStatus.SUBMIT_READY.value)
-            if ready >= config.target_ready:
-                return self._finish(f"target_ready reached: {ready}")
-
-        ready = self.repo.count_candidates(self.run_id, CandidateStatus.SUBMIT_READY.value)
-        return self._finish(f"max_iterations reached with submit_ready={ready}")
+            return self._finish(f"max_iterations reached with submit_ready={ready}")
+        except Exception as exc:
+            run = self.repo.get_run(self.run_id) or {}
+            stage = run.get("stage") or "UNKNOWN"
+            return self._fail(f"Unhandled run error in {stage}: {type(exc).__name__}: {exc}")
 
     def _run_real(self, config: RunConfig, *, resume: bool = False) -> str:
         run = self.repo.get_run(self.run_id)
@@ -109,6 +122,14 @@ class BatchLoopController:
                         path = Path(str(artifact.get("path")))
                         if path.exists():
                             alpha_lists.append(path)
+            field_factory = inspect_adapter.write_field_factory_alpha_list(config)
+            if field_factory.status != "ok":
+                return self._fail(field_factory.error_summary or "Field Factory failed")
+            for artifact in field_factory.artifacts:
+                if artifact.get("kind") == "alpha_list_field_factory":
+                    path = Path(str(artifact.get("path")))
+                    if path.exists():
+                        alpha_lists.append(path)
             if not alpha_lists:
                 return self._fail("INSPECT completed but no alpha_list artifacts were recorded")
             combined_alpha_list = inspect_adapter.write_combined_alpha_list(alpha_lists)
@@ -123,6 +144,39 @@ class BatchLoopController:
                 simulated = BatchSimAdapter(self.repo, self.run_id, self.paths.run_dir).run_real(combined_alpha_list, config)
             if simulated.status != "ok":
                 return self._fail(simulated.error_summary or "SIMULATE failed")
+
+            if iteration < config.max_iterations and int(config.max_variant_alphas) > 0:
+                self.repo.update_run_stage(self.run_id, RunStage.VARIANT_SEARCH.value)
+                variant_result = VariantSearchAdapter(self.repo, self.run_id, self.paths.run_dir).run(
+                    combined_alpha_list,
+                    config,
+                    iteration=iteration,
+                )
+                if variant_result.status != "ok":
+                    return self._fail(variant_result.error_summary or "VARIANT_SEARCH failed")
+                variant_alpha_list = self._latest_artifact_path(kind="alpha_list_variants", stage="VARIANT_SEARCH")
+                if variant_result.candidates_delta and variant_alpha_list and _path_has_rows(variant_alpha_list):
+                    self.repo.add_decision(
+                        self.run_id,
+                        iteration,
+                        json.dumps(
+                            {
+                                "type": "variant_search",
+                                "variant_count": len(variant_result.candidates_delta),
+                                "alpha_list": str(variant_alpha_list),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "Generated local variants from simulated candidates with weak or repairable signal.",
+                        variant_result.candidates_delta,
+                    )
+                    self.repo.update_run_stage(self.run_id, RunStage.SIMULATE.value)
+                    variant_simulated = BatchSimAdapter(self.repo, self.run_id, self.paths.run_dir).run_real(
+                        variant_alpha_list,
+                        config,
+                    )
+                    if variant_simulated.status != "ok":
+                        return self._fail(variant_simulated.error_summary or "SIMULATE variants failed")
 
             self.repo.update_run_stage(self.run_id, RunStage.DECIDE.value)
             enhance_inputs = self._enhance_inputs()
@@ -230,6 +284,7 @@ class BatchLoopController:
 
     def _enhance_inputs(self) -> list[dict]:
         latest_sim = self.repo.latest_sim_results_by_candidate(self.run_id)
+        latest_gate = _latest_gate_by_candidate(self.repo, self.run_id)
         rows = [
             c
             for c in self.repo.list_rows("candidates", self.run_id)
@@ -239,6 +294,7 @@ class BatchLoopController:
         for candidate in rows:
             item = dict(candidate)
             sim = latest_sim.get(int(candidate.get("candidate_id") or 0))
+            gate = latest_gate.get(int(candidate.get("candidate_id") or 0))
             if sim:
                 item["latest_sim_result"] = sim
                 item["failure_tags"] = [
@@ -251,12 +307,14 @@ class BatchLoopController:
                     item["diagnosis"] = json.loads(sim.get("diagnosis_json") or "{}")
                 except json.JSONDecodeError:
                     item["diagnosis"] = {}
-            score = score_candidate(item, sim, self._memory_context())
+            if gate:
+                item["latest_gate_check"] = gate
+            score = score_candidate(item, sim, self._memory_context(), gate)
             item["selection_score"] = score.score
             item["score_breakdown"] = score.breakdown
             self.repo.update_candidate_score(self.run_id, int(candidate.get("candidate_id") or 0), score.score, score.breakdown)
             enriched.append(item)
-        return score_candidates(enriched, latest_sim, self._memory_context())
+        return score_candidates(enriched, latest_sim, self._memory_context(), latest_gate)
 
     def _artifact_paths(self, *, kind: str, stage: str) -> list[Path]:
         paths = []
@@ -300,3 +358,20 @@ def load_config_from_run(repo: Repository, run_id: str) -> RunConfig:
     if not run:
         raise ValueError(f"Run not found: {run_id}")
     return RunConfig(**json.loads(run["config_json"]))
+
+
+def _path_has_rows(path: Path) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, list) and bool(data)
+
+
+def _latest_gate_by_candidate(repo: Repository, run_id: str) -> dict[int, dict]:
+    latest: dict[int, dict] = {}
+    for row in repo.list_rows("gate_checks", run_id):
+        candidate_id = int(row.get("candidate_id") or 0)
+        if candidate_id:
+            latest[candidate_id] = row
+    return latest

@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,11 @@ CREATE TABLE IF NOT EXISTS memory_candidate_observations (
   expression TEXT,
   status TEXT,
   source TEXT,
+  parent_candidate_id INTEGER,
+  variant_strategy TEXT,
+  thesis_id TEXT,
+  thesis_type TEXT,
+  thesis_json TEXT,
   selection_score REAL,
   score_breakdown_json TEXT,
   operators_json TEXT,
@@ -134,6 +140,10 @@ OPERATORS = {
 }
 
 
+LEARNABLE_MEMORY_LAYERS = {"simulated", "promising", "gate_passed"}
+MEMORY_DECAY_HALF_LIFE_DAYS = 120.0
+
+
 class AlphaMemory:
     def __init__(self, memory_path: str | Path):
         self.memory_path = Path(memory_path)
@@ -141,6 +151,11 @@ class AlphaMemory:
         self.conn = sqlite3.connect(self.memory_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(MEMORY_SCHEMA)
+        self._ensure_column("memory_candidate_observations", "parent_candidate_id", "INTEGER")
+        self._ensure_column("memory_candidate_observations", "variant_strategy", "TEXT")
+        self._ensure_column("memory_candidate_observations", "thesis_id", "TEXT")
+        self._ensure_column("memory_candidate_observations", "thesis_type", "TEXT")
+        self._ensure_column("memory_candidate_observations", "thesis_json", "TEXT")
         self.conn.commit()
 
     @classmethod
@@ -149,6 +164,11 @@ class AlphaMemory:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if column not in {str(row["name"]) for row in rows}:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def ingest_run(self, repo: Repository, run_id: str) -> dict[str, Any]:
         run = repo.get_run(run_id)
@@ -219,14 +239,16 @@ class AlphaMemory:
             sim = latest_sim.get(candidate_id) or {}
             gate = latest_gate.get(candidate_id) or {}
             expression = str(candidate.get("expression") or "")
+            thesis = _json_obj(candidate.get("thesis_json"))
             self.conn.execute(
                 """
                 INSERT INTO memory_candidate_observations(
                   run_id, candidate_id, dataset, region, universe, delay, data_type, neutralization,
-                  expression, status, source, selection_score, score_breakdown_json,
+                  expression, status, source, parent_candidate_id, variant_strategy, thesis_id, thesis_type, thesis_json,
+                  selection_score, score_breakdown_json,
                   operators_json, field_families_json, alpha_id, sim_status, sharpe, fitness, turnover, pnl,
                   failure_tags_json, repair_objectives_json, gate_passed, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -240,6 +262,11 @@ class AlphaMemory:
                     expression,
                     candidate.get("status", ""),
                     candidate.get("source", ""),
+                    candidate.get("parent_candidate_id"),
+                    candidate.get("variant_strategy", ""),
+                    thesis.get("thesis_id") or "",
+                    thesis.get("thesis_type") or "",
+                    json.dumps(thesis, ensure_ascii=False, sort_keys=True),
                     candidate.get("selection_score") or 0,
                     candidate.get("score_breakdown") or "{}",
                     json.dumps(extract_operators(expression), ensure_ascii=False),
@@ -273,15 +300,33 @@ class AlphaMemory:
         observations = [
             dict(row) for row in self.conn.execute("SELECT * FROM memory_candidate_observations" + where, params).fetchall()
         ]
+        layer_counts = _layer_counts(observations)
+        learnable_observations = [row for row in observations if _memory_learnable(row)]
         return {
             "memory_path": str(self.memory_path),
             "filters": {"dataset": dataset or "", "region": region or ""},
             "run_count": len(runs),
             "candidate_observation_count": len(observations),
+            "generated_observation_count": layer_counts.get("generated", 0),
+            "precheck_failed_observation_count": layer_counts.get("precheck_failed", 0),
+            "simulated_observation_count": layer_counts.get("simulated", 0),
+            "gate_passed_observation_count": layer_counts.get("gate_passed", 0),
+            "memory_layer_counts": layer_counts,
+            "learnable_observation_count": len(learnable_observations),
             "dataset_settings": _dataset_settings_summary(runs, limit),
             "top_failure_tags": _counter_from_json_dicts(runs, "failure_tags_json", limit),
             "top_operators": _counter_from_json_lists(observations, "operators_json", limit),
+            "top_learned_operators": _counter_from_json_lists(learnable_observations, "operators_json", limit),
             "top_field_families": _counter_from_json_lists(observations, "field_families_json", limit),
+            "top_learned_field_families": _counter_from_json_lists(
+                learnable_observations, "field_families_json", limit
+            ),
+            "top_thesis_types": _counter_from_column(observations, "thesis_type", limit),
+            "top_learned_thesis_types": _counter_from_column(learnable_observations, "thesis_type", limit),
+            "top_expected_failure_modes": _counter_from_thesis_lists(observations, "expected_failure_modes", limit),
+            "top_learned_repair_methods": _counter_from_thesis_lists(
+                learnable_observations, "intended_repair_methods", limit
+            ),
             "recent_runs": sorted(
                 [
                     {
@@ -343,9 +388,17 @@ def render_memory_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- memory_path: {summary.get('memory_path')}")
     lines.append(f"- run_count: {summary.get('run_count')}")
     lines.append(f"- candidate_observation_count: {summary.get('candidate_observation_count')}")
+    lines.append(f"- learnable_observation_count: {summary.get('learnable_observation_count')}")
+    lines.append(f"- simulated_observation_count: {summary.get('simulated_observation_count')}")
+    lines.append(f"- gate_passed_observation_count: {summary.get('gate_passed_observation_count')}")
     filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
     if filters.get("dataset") or filters.get("region"):
         lines.append(f"- filters: dataset={filters.get('dataset') or '*'}, region={filters.get('region') or '*'}")
+    lines.append("")
+    lines.append("## Memory Layers")
+    layer_counts = summary.get("memory_layer_counts") if isinstance(summary.get("memory_layer_counts"), dict) else {}
+    for layer in ("generated", "precheck_failed", "simulated", "promising", "gate_passed"):
+        lines.append(f"- {layer}: {layer_counts.get(layer, 0)}")
     lines.append("")
     lines.append("## Dataset Settings")
     for row in summary.get("dataset_settings", []) or []:
@@ -364,8 +417,26 @@ def render_memory_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("## Top Operators")
     lines.extend(_render_counter(summary.get("top_operators")))
     lines.append("")
+    lines.append("## Top Learned Operators")
+    lines.extend(_render_counter(summary.get("top_learned_operators")))
+    lines.append("")
     lines.append("## Top Field Families")
     lines.extend(_render_counter(summary.get("top_field_families")))
+    lines.append("")
+    lines.append("## Top Learned Field Families")
+    lines.extend(_render_counter(summary.get("top_learned_field_families")))
+    lines.append("")
+    lines.append("## Top Thesis Types")
+    lines.extend(_render_counter(summary.get("top_thesis_types")))
+    lines.append("")
+    lines.append("## Top Learned Thesis Types")
+    lines.extend(_render_counter(summary.get("top_learned_thesis_types")))
+    lines.append("")
+    lines.append("## Expected Failure Modes")
+    lines.extend(_render_counter(summary.get("top_expected_failure_modes")))
+    lines.append("")
+    lines.append("## Learned Repair Methods")
+    lines.extend(_render_counter(summary.get("top_learned_repair_methods")))
     lines.append("")
     lines.append("## Recent Runs")
     for row in summary.get("recent_runs", []) or []:
@@ -396,17 +467,43 @@ def extract_field_families(expression: str) -> list[str]:
 def build_scoring_context(observations: list[dict[str, Any]]) -> dict[str, Any]:
     operator_stats: dict[str, dict[str, Any]] = {}
     field_family_stats: dict[str, dict[str, Any]] = {}
+    thesis_type_stats: dict[str, dict[str, Any]] = {}
+    repair_method_stats: dict[str, dict[str, Any]] = {}
+    variant_strategy_stats: dict[str, dict[str, Any]] = {}
+    layer_counts = _layer_counts(observations)
+    learnable_count = 0
     for row in observations:
+        if not _memory_learnable(row):
+            continue
+        learnable_count += 1
         success = _memory_success(row)
         failure_tags = _json_list(row.get("failure_tags_json"))
+        weight = _recency_weight(row.get("ingested_at"))
+        sharpe = _float_or_none(row.get("sharpe"))
+        fitness = _float_or_none(row.get("fitness"))
+        turnover = _float_or_none(row.get("turnover"))
         for op in _json_list(row.get("operators_json")):
-            _update_memory_stat(operator_stats, str(op), success, failure_tags)
+            _update_memory_stat(operator_stats, str(op), success, failure_tags, weight, sharpe=sharpe, fitness=fitness, turnover=turnover)
         for family in _json_list(row.get("field_families_json")):
-            _update_memory_stat(field_family_stats, str(family), success, failure_tags)
+            _update_memory_stat(field_family_stats, str(family), success, failure_tags, weight, sharpe=sharpe, fitness=fitness, turnover=turnover)
+        thesis = _json_obj(row.get("thesis_json"))
+        thesis_type = str(row.get("thesis_type") or thesis.get("thesis_type") or "")
+        _update_memory_stat(thesis_type_stats, thesis_type, success, failure_tags, weight, sharpe=sharpe, fitness=fitness, turnover=turnover)
+        for method in _json_list(thesis.get("intended_repair_methods") or []):
+            _update_memory_stat(repair_method_stats, str(method), success, failure_tags, weight, sharpe=sharpe, fitness=fitness, turnover=turnover)
+        variant_strategy = str(row.get("variant_strategy") or "")
+        if variant_strategy:
+            _update_memory_stat(variant_strategy_stats, variant_strategy, success, failure_tags, weight, sharpe=sharpe, fitness=fitness, turnover=turnover)
     return {
         "observation_count": len(observations),
+        "learnable_observation_count": learnable_count,
+        "memory_layer_counts": layer_counts,
+        "recency_half_life_days": MEMORY_DECAY_HALF_LIFE_DAYS,
         "operator_stats": _finalize_memory_stats(operator_stats),
         "field_family_stats": _finalize_memory_stats(field_family_stats),
+        "thesis_type_stats": _finalize_memory_stats(thesis_type_stats),
+        "repair_method_stats": _finalize_memory_stats(repair_method_stats),
+        "variant_strategy_stats": _finalize_memory_stats(variant_strategy_stats),
     }
 
 
@@ -433,6 +530,16 @@ def _json_list(value: Any) -> list[Any]:
     return data if isinstance(data, list) else []
 
 
+def _json_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        data = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _memory_success(row: dict[str, Any]) -> bool:
     status = str(row.get("status") or "")
     if status in {"submit_ready", "manual_review"}:
@@ -447,15 +554,112 @@ def _memory_success(row: dict[str, Any]) -> bool:
     return sharpe >= 0.8 and fitness >= 0.5
 
 
-def _update_memory_stat(stats: dict[str, dict[str, Any]], key: str, success: bool, failure_tags: list[Any]) -> None:
+def _memory_layer(row: dict[str, Any]) -> str:
+    if int(row.get("gate_passed") or 0):
+        return "gate_passed"
+    status = str(row.get("status") or "")
+    if status in {"submit_ready", "manual_review", "promising", "needs_enhance"}:
+        return "promising"
+    if _has_sim_evidence(row):
+        return "simulated"
+    if status in {"sim_failed", "rejected"}:
+        return "precheck_failed"
+    return "generated"
+
+
+def _memory_learnable(row: dict[str, Any]) -> bool:
+    return _memory_layer(row) in LEARNABLE_MEMORY_LAYERS or _memory_success(row)
+
+
+def _has_sim_evidence(row: dict[str, Any]) -> bool:
+    if str(row.get("sim_status") or "").strip():
+        return True
+    if str(row.get("alpha_id") or "").strip():
+        return True
+    return any(row.get(key) not in (None, "") for key in ("sharpe", "fitness", "turnover", "pnl"))
+
+
+def _layer_counts(observations: list[dict[str, Any]]) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for row in observations:
+        counter[_memory_layer(row)] += 1
+    return {
+        layer: counter.get(layer, 0)
+        for layer in ("generated", "precheck_failed", "simulated", "promising", "gate_passed")
+    }
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _recency_weight(value: Any) -> float:
+    if not value:
+        return 1.0
+    raw = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 1.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_days = max((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0, 0.0)
+    return round(0.5 ** (age_days / MEMORY_DECAY_HALF_LIFE_DAYS), 6)
+
+
+def _update_memory_stat(
+    stats: dict[str, dict[str, Any]],
+    key: str,
+    success: bool,
+    failure_tags: list[Any],
+    weight: float,
+    sharpe: float | None = None,
+    fitness: float | None = None,
+    turnover: float | None = None,
+) -> None:
     if not key:
         return
-    row = stats.setdefault(key, {"observations": 0, "successes": 0, "failure_tags": Counter()})
+    row = stats.setdefault(
+        key,
+        {
+            "observations": 0,
+            "successes": 0,
+            "weighted_observations": 0.0,
+            "weighted_successes": 0.0,
+            "failure_tags": Counter(),
+            "weighted_failure_tags": Counter(),
+            "sharpe_values": [],
+            "fitness_values": [],
+            "turnover_values": [],
+        },
+    )
     row["observations"] += 1
+    row["weighted_observations"] += float(weight)
     if success:
         row["successes"] += 1
+        row["weighted_successes"] += float(weight)
     for tag in failure_tags:
         row["failure_tags"][str(tag)] += 1
+        row["weighted_failure_tags"][str(tag)] += float(weight)
+    if sharpe is not None:
+        row["sharpe_values"].append(sharpe)
+    if fitness is not None:
+        row["fitness_values"].append(fitness)
+    if turnover is not None:
+        row["turnover_values"].append(turnover)
+
+
+HARD_FAILURE_TAGS = {"syntax_error", "unknown_variable", "hard_error", "coverage_issue"}
+
+
+def _hard_failure_rate_from_tags(failure_tags: dict[str, Any], weighted_observations: float) -> float:
+    if not weighted_observations:
+        return 0.0
+    hard_count = sum(count for tag, count in dict(failure_tags).items() if tag in HARD_FAILURE_TAGS)
+    return round(min(hard_count / weighted_observations, 1.0), 4)
 
 
 def _finalize_memory_stats(stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -463,11 +667,25 @@ def _finalize_memory_stats(stats: dict[str, dict[str, Any]]) -> dict[str, dict[s
     for key, row in stats.items():
         observations = int(row.get("observations") or 0)
         successes = int(row.get("successes") or 0)
+        weighted_observations = float(row.get("weighted_observations") or observations)
+        weighted_successes = float(row.get("weighted_successes") or successes)
+        failure_tags = dict(row.get("failure_tags") or {})
+        weighted_failure_tags = dict(row.get("weighted_failure_tags") or failure_tags)
+        hard_failure_rate = _hard_failure_rate_from_tags(weighted_failure_tags, weighted_observations)
         finalized[key] = {
             "observations": observations,
             "successes": successes,
-            "success_rate": round(successes / observations, 4) if observations else 0.0,
-            "failure_tags": dict(row.get("failure_tags") or {}),
+            "effective_observations": round(weighted_observations, 4),
+            "success_rate": round(weighted_successes / weighted_observations, 4) if weighted_observations else 0.0,
+            "raw_success_rate": round(successes / observations, 4) if observations else 0.0,
+            "confidence": round(min(weighted_observations / 20.0, 1.0), 4),
+            "failure_tags": failure_tags,
+            "non_success_rate": round(1.0 - (weighted_successes / weighted_observations), 4) if weighted_observations else 0.0,
+            "failure_rate": hard_failure_rate,
+            "hard_failure_rate": hard_failure_rate,
+            "avg_sharpe": _avg(row.get("sharpe_values") or []),
+            "avg_fitness": _avg(row.get("fitness_values") or []),
+            "avg_turnover": _avg(row.get("turnover_values") or []),
         }
     return finalized
 
@@ -528,7 +746,7 @@ def _counter_from_json_dicts(rows: list[dict[str, Any]], key: str, limit: int) -
         if isinstance(data, dict):
             for item, count in data.items():
                 counter[str(item)] += int(count or 0)
-    return [{"key": key, "count": count} for key, count in counter.most_common(limit)]
+    return [{"key": item, "count": count} for item, count in counter.most_common(limit)]
 
 
 def _counter_from_json_lists(rows: list[dict[str, Any]], key: str, limit: int) -> list[dict[str, Any]]:
@@ -541,7 +759,29 @@ def _counter_from_json_lists(rows: list[dict[str, Any]], key: str, limit: int) -
         if isinstance(data, list):
             for item in data:
                 counter[str(item)] += 1
-    return [{"key": key, "count": count} for key, count in counter.most_common(limit)]
+    return [{"key": item, "count": count} for item, count in counter.most_common(limit)]
+
+
+def _counter_from_column(rows: list[dict[str, Any]], key: str, limit: int) -> list[dict[str, Any]]:
+    counter: Counter[str] = Counter()
+    for row in rows:
+        value = str(row.get(key) or "").strip()
+        if value:
+            counter[value] += 1
+    return [{"key": item, "count": count} for item, count in counter.most_common(limit)]
+
+
+def _counter_from_thesis_lists(rows: list[dict[str, Any]], key: str, limit: int) -> list[dict[str, Any]]:
+    counter: Counter[str] = Counter()
+    for row in rows:
+        data = _json_obj(row.get("thesis_json"))
+        values = data.get(key)
+        if isinstance(values, list):
+            for value in values:
+                item = str(value).strip()
+                if item:
+                    counter[item] += 1
+    return [{"key": item, "count": count} for item, count in counter.most_common(limit)]
 
 
 def _render_counter(rows: Any) -> list[str]:

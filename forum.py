@@ -73,7 +73,7 @@ class ForumService:
             "analysis": analyze_glossary_terms(terms),
         }
 
-    async def search(self, query: str, *, max_results: int = 20, locale: str = "zh-cn") -> dict[str, Any]:
+    async def search(self, query: str, *, max_results: int = 50, locale: str = "zh-cn") -> dict[str, Any]:
         client = _forum_client()
         payload = await client.search_forum_posts(self.email, self.password, query, max_results, locale=locale)
         results = payload.get("results", []) if isinstance(payload, dict) else []
@@ -455,9 +455,9 @@ def summarize_forum_learning_with_llm(payload: dict[str, Any]) -> dict[str, Any]
 
 
 def _post_chat_completion(creds: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
-    url = creds["moonshot_base_url"].rstrip("/") + "/chat/completions"
+    url = creds["llm_base_url"].rstrip("/") + "/chat/completions"
     headers = {
-        "Authorization": f"Bearer {creds['moonshot_api_key']}",
+        "Authorization": f"Bearer {creds['llm_api_key']}",
         "Content-Type": "application/json",
     }
     try:
@@ -534,7 +534,7 @@ def _build_learning_llm_payload(payload: dict[str, Any], creds: dict[str, str]) 
         },
     }
     return {
-        "model": os.environ.get("MOONSHOT_MODEL") or creds.get("moonshot_model", "kimi-k2.5"),
+        "model": os.environ.get("LLM_MODEL") or os.environ.get("MOONSHOT_MODEL") or creds.get("llm_model", "kimi-k2.5"),
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
         "temperature": 1,
     }

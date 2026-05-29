@@ -121,6 +121,8 @@ class TaskRunner:
         *,
         env: dict[str, str] | None = None,
         on_start: Callable[[TaskHandle], None] | None = None,
+        on_progress: Callable[[TaskHandle], None] | None = None,
+        progress_interval_seconds: int = 30,
     ) -> tuple[TaskHandle, int]:
         task_id = f"{adapter}_{uuid.uuid4().hex[:10]}"
         task_dir = self.tasks_dir / task_id
@@ -138,6 +140,7 @@ class TaskRunner:
             "created_at": now_iso(),
         }
         with stdout_path.open("a", encoding="utf-8") as out, stderr_path.open("a", encoding="utf-8") as err:
+            popen_kwargs = {"start_new_session": True} if os.name != "nt" else {}
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd),
@@ -147,13 +150,23 @@ class TaskRunner:
                 encoding="utf-8",
                 errors="replace",
                 env=env,
+                **popen_kwargs,
             )
             meta["pid"] = proc.pid
             (task_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             handle = TaskHandle(task_id, int(meta["pid"] or 0), task_dir, stdout_path, stderr_path)
             if on_start:
                 on_start(handle)
-            returncode = proc.wait()
+            if on_progress:
+                while proc.poll() is None:
+                    on_progress(handle)
+                    try:
+                        proc.wait(timeout=max(1, int(progress_interval_seconds)))
+                    except subprocess.TimeoutExpired:
+                        continue
+                returncode = proc.returncode
+            else:
+                returncode = proc.wait()
         return handle, int(returncode)
 
 
