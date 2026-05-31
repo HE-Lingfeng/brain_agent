@@ -525,7 +525,7 @@ make/enhance prompt 只读取 approved lessons，不读取未批准的 forum lea
 | `--use-llm-decide` | DECIDE 阶段使用 LLM 生成 enhancement actions |
 | `--max-enhance-actions` | 每轮最多 enhancement actions |
 
-`worker --mode drain` 可对已有 run 非交互持续消耗 `sim_pending` / `sim_retryable` 队列。`--batch-candidates-limit 0` 表示使用 `batch_size * concurrency` 作为每轮候选上限；如果设置 `--max-total-alphas`，worker 会在每轮提交前按剩余额度进一步收紧本轮上限。
+`worker --mode drain` 可对已有 run 非交互持续消耗 `sim_pending` / `sim_retryable` 队列。`--batch-candidates-limit 0` 表示使用 `batch_size * concurrency` 作为每轮候选上限；如果设置 `--max-total-alphas`，worker 会在每轮提交前按剩余额度进一步收紧本轮上限。`--refill-on-empty` 会在队列耗尽时自动执行一次新的 `GENERATE -> INSPECT -> field_factory` 补料，再继续消耗 simulation 队列；`--max-empty-refills 0` 表示长跑期间不限补料次数。
 | `--dry-run` | 不访问真实 BRAIN/LLM，跑本地 mock 闭环 |
 
 常用 preset 由 `settings` 子命令管理：

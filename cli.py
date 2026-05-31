@@ -89,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     worker_p.add_argument("--batch-candidates-limit", type=int, default=0, help="Max candidates per batch (0 = batch_size * concurrency)")
     worker_p.add_argument("--batch-size", type=int, default=None, help="Override batch_size from run config")
     worker_p.add_argument("--concurrency", type=int, default=None, help="Override concurrency from run config")
+    worker_p.add_argument("--refill-on-empty", action="store_true", help="Generate and inspect new candidates when the simulation queue is empty")
+    worker_p.add_argument("--max-empty-refills", type=int, default=3, help="Maximum empty-queue refill attempts in drain mode; 0 means unlimited")
 
     report_p = sub.add_parser("report")
     report_p.add_argument("--run-id", required=True)
@@ -524,8 +526,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
         worker = SimulationWorker(repo, args.run_id, paths, config)
 
         if args.mode == "once":
-            stats = worker.run_once(max_retries=args.max_retries, max_candidates_per_batch=limit)
+            stats = worker.run_once(
+                max_retries=args.max_retries,
+                max_candidates_per_batch=limit,
+                refill_on_empty=args.refill_on_empty,
+            )
         else:
+            max_empty_refills = None if int(args.max_empty_refills) <= 0 else int(args.max_empty_refills)
             stats = worker.run_drain(
                 idle_sleep=args.idle_sleep_seconds,
                 max_runtime_hours=args.max_runtime_hours,
@@ -533,6 +540,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 max_total_alphas=args.max_total_alphas,
                 max_retries=args.max_retries,
                 max_candidates_per_batch=limit,
+                refill_on_empty=args.refill_on_empty,
+                max_empty_refills=max_empty_refills,
             )
 
         if stats.total_submitted == 0:

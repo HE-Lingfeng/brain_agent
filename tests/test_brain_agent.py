@@ -45,6 +45,7 @@ from brain_agent.variant_search import (
     _pearson_corr,
     _pnl_prune,
 )
+from brain_agent.worker import SimulationWorker
 
 
 def _load_batch_simulator_module():
@@ -1637,6 +1638,62 @@ class BrainAgentTests(unittest.TestCase):
         rows = json.loads(Path(payload["alpha_list"]).read_text(encoding="utf-8"))
         self.assertEqual(["rank(close)"], [row["regular"] for row in rows])
         self.assertEqual("USA", rows[0]["settings"]["region"])
+
+    def test_worker_refill_on_empty_generates_pending_candidates(self) -> None:
+        def fake_make(adapter, config):
+            idea_path = adapter.artifacts_dir / "01_generate" / "refill_idea.json"
+            write_json(idea_path, {"idea": "refill"})
+            artifact = adapter.record_artifact("idea_file", idea_path, "GENERATE")
+            return AdapterResult(status="ok", artifacts=[artifact])
+
+        def fake_inspect(adapter, idea_file, config):
+            path = adapter.write_alpha_list_for_candidates(
+                [{"expression": "rank(price_close)"}],
+                config,
+                name="refill_alpha_list.json",
+            )
+            return AdapterResult(status="ok", artifacts=[adapter.record_artifact("alpha_list", path, "INSPECT")])
+
+        with patch.object(MakeSomeGemAdapter, "run_real", fake_make), patch.object(
+            InspectRawTemplateAdapter, "run_real", fake_inspect
+        ), patch.object(
+            InspectRawTemplateAdapter,
+            "write_field_factory_alpha_list",
+            return_value=AdapterResult(status="ok"),
+        ), patch.object(
+            BatchSimAdapter,
+            "run_real",
+            return_value=AdapterResult(status="ok", metrics_delta=[{"status": "COMPLETE"}]),
+        ):
+            stats = SimulationWorker(self.repo, "test_run", self.paths, self.config).run_once(refill_on_empty=True)
+
+        self.assertEqual(1, stats.total_submitted)
+        rows = self.repo.find_candidates_by_status("test_run", [CandidateStatus.SIM_PENDING.value])
+        self.assertEqual(["rank(price_close)"], [row["expression"] for row in rows])
+
+    def test_worker_refill_uses_generated_expressions_directly(self) -> None:
+        def fake_make(adapter, config):
+            return AdapterResult(
+                status="ok",
+                candidates_delta=[
+                    {"candidate_id": 1, "expression": "rank(ts_mean(price_close, 20))", "fingerprint": "fp"}
+                ],
+            )
+
+        with patch.object(MakeSomeGemAdapter, "run_real", fake_make), patch.object(
+            InspectRawTemplateAdapter,
+            "write_field_factory_alpha_list",
+            return_value=AdapterResult(status="ok"),
+        ), patch.object(
+            BatchSimAdapter,
+            "run_real",
+            return_value=AdapterResult(status="ok", metrics_delta=[{"status": "COMPLETE"}]),
+        ):
+            stats = SimulationWorker(self.repo, "test_run", self.paths, self.config).run_once(refill_on_empty=True)
+
+        self.assertEqual(1, stats.total_submitted)
+        rows = self.repo.find_candidates_by_status("test_run", [CandidateStatus.SIM_PENDING.value])
+        self.assertEqual(["rank(ts_mean(price_close, 20))"], [row["expression"] for row in rows])
 
     def test_batch_simulator_slot_limits_are_region_aware(self) -> None:
         batch_simulator = _load_batch_simulator_module()

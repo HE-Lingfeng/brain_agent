@@ -200,10 +200,13 @@ Use `--dry-run` to write `alpha_list_retryable.json` without submitting.
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
   --run-id <run_id> \
   --mode drain \
-  --max-total-alphas 5000
+  --max-total-alphas 5000 \
+  --refill-on-empty
 ```
 
 Each batch is capped to `batch_size * concurrency` candidates by default. `--max-total-alphas` is enforced against the remaining quota before each batch starts. Use `--mode once` for a single batch.
+
+`--refill-on-empty` turns the worker into a closer approximation of a daemon queue: when no `sim_pending` or `sim_retryable` candidates remain, it runs a new `GENERATE -> INSPECT -> field_factory` refill and then keeps draining. `--max-empty-refills` defaults to 3 in drain mode; set it to `0` for unlimited refills during a supervised long run.
 
 ### Simulation Quota Allocator
 
