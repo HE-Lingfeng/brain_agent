@@ -87,9 +87,16 @@ def load_forum_learning_report(path: Path) -> dict[str, Any]:
             raise ValueError(f"Forum learning report must be a JSON object: {resolved}")
         return data
 
-    fenced = _extract_fenced_json(text, "brain_agent_forum_learning_payload")
+    try:
+        fenced = _extract_fenced_json(text, "brain_agent_forum_learning_payload")
+    except json.JSONDecodeError:
+        fenced = None
     if fenced is not None:
         return fenced
+
+    generic = _extract_machine_readable_json(text)
+    if generic is not None:
+        return _normalize_machine_readable_report(generic, text, resolved)
 
     return _parse_legacy_markdown_report(text)
 
@@ -271,6 +278,107 @@ def _extract_fenced_json(text: str, info_suffix: str) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         raise ValueError("Machine-readable JSON payload must be an object")
     return data
+
+
+def _extract_machine_readable_json(text: str) -> dict[str, Any] | None:
+    section = _section_text(text, "Machine Readable (JSON)") or _section_text(text, "Machine Readable")
+    if not section:
+        return None
+    match = re.search(r"```json\s*(.*?)```", section, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1).strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("Machine-readable JSON payload must be an object")
+    return data
+
+
+def _normalize_machine_readable_report(data: dict[str, Any], text: str, path: Path) -> dict[str, Any]:
+    if isinstance(data.get("llm_learning"), dict) or "proposed_system_updates" in data:
+        return data
+    if "template_categories" not in data and "key_insights" not in data and "top_rated_templates" not in data:
+        return data
+
+    total_templates = data.get("total_templates")
+    categories = data.get("template_categories") if isinstance(data.get("template_categories"), dict) else {}
+    category_summary = ", ".join(
+        f"{name}: {meta.get('range', meta.get('count', ''))}"
+        for name, meta in categories.items()
+        if isinstance(meta, dict)
+    )
+    top_templates = _string_list(data.get("top_rated_templates"))
+    key_insights = _string_list(data.get("key_insights"))
+    summary_parts = ["论坛高票Alpha模板库已整理为可审批知识。"]
+    if total_templates:
+        summary_parts.append(f"机器可读区记录 total_templates={total_templates}。")
+    if category_summary:
+        summary_parts.append(f"覆盖分类: {category_summary}。")
+    if top_templates:
+        summary_parts.append("Top templates: " + "; ".join(top_templates[:5]))
+
+    learning = {
+        "summary_cn": " ".join(summary_parts),
+        "experience_lessons": key_insights[:10],
+        "alpha_research_patterns": _template_report_patterns(data, text),
+        "pitfalls": _template_report_pitfalls(data, text),
+        "proposed_system_updates": [
+            {
+                "title": "吸纳高票论坛Alpha模板库",
+                "target": "brain_agent generation knowledge and prompt policy",
+                "why": "Template-library reports encode reusable alpha construction patterns, dataset-category routing, neutralization guidance, and data handling rules that should steer generation without copying forum text verbatim.",
+                "change": "Approve the report into compact knowledge and fold its durable lessons into BRAIN_AGENT_RESEARCH_POLICY_JSON as soft template guidance.",
+                "risk": "Community templates can overfit or rely on unavailable operators; keep operator prechecks, dataset-field matching, and simulation gates as hard constraints.",
+                "approval_status": "pending",
+            }
+        ],
+        "approval_required": bool(data.get("approval_required", True)),
+        "source_report_type": "template_library",
+        "template_library": {
+            "total_templates": total_templates,
+            "template_categories": categories,
+            "top_rated_templates": top_templates[:10],
+        },
+    }
+    return {
+        "success": True,
+        "query": path.stem,
+        "llm_learning": learning,
+        "machine_readable": data,
+    }
+
+
+def _template_report_patterns(data: dict[str, Any], text: str) -> list[str]:
+    patterns = []
+    categories = data.get("template_categories") if isinstance(data.get("template_categories"), dict) else {}
+    if categories:
+        patterns.append("Select template families by dataset category before filling fields: PV, fundamental, analyst, news/sentiment, option, macro, model.")
+    top_templates = _string_list(data.get("top_rated_templates"))
+    patterns.extend(top_templates[:5])
+    if "经济学时间窗口" in text:
+        patterns.append("Prefer economically meaningful trading windows: 5, 22, 66, 120, 252, 504.")
+    if "to_nan" in text and "ts_quantile" in text:
+        patterns.append("For sparse macro-like data, apply to_nan + ts_backfill and prefer ts_quantile for robust outlier handling.")
+    if "中性化选择策略" in text:
+        patterns.append("Choose neutralization by dataset family rather than applying one default to every template.")
+    if "get_operators" in text:
+        patterns.append("Pre-check operator availability before selecting templates.")
+    return patterns
+
+
+def _template_report_pitfalls(data: dict[str, Any], text: str) -> list[str]:
+    pitfalls = []
+    if "厂字形" in text:
+        pitfalls.append("Reject factory-shaped alphas early: long flat PnL regions or repeated identical values waste simulation budget.")
+    if "reversion component" in text:
+        pitfalls.append("Price/turnover reversion templates may trigger platform reversion warnings and need extra scrutiny.")
+    if "无权限" in text or "权限" in text:
+        pitfalls.append("Do not emit templates that require unavailable operators.")
+    if data.get("approval_required", True):
+        pitfalls.append("Community templates remain soft guidance and do not grant automatic submission permission.")
+    return pitfalls
 
 
 def _parse_legacy_markdown_report(text: str) -> dict[str, Any]:

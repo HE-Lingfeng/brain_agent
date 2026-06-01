@@ -287,6 +287,7 @@ SQLite 主要表：
 - BRAIN batch simulation 长时间等待时，优先看 task logs 和 `simulation_status.csv`，不要只根据前台超时判断失败。
 - batch simulator 在提交前会剥离 `factor_thesis`、`lineage`、`variant_params` 等内部研究元数据，只把 BRAIN simulation API 接受的顶层字段发送给平台。
 - batch parent 默认最多等待 30 分钟生成 children，child simulation 默认最多等待 60 分钟完成；高峰期 `[BRAIN wait]` 不代表失败。
+- 连续等待超过 15 分钟时，batch simulator 会写出 `[BRAIN healthcheck]` 日志、刷新 BRAIN session 并继续 polling；这是恢复动作，不会直接把 alpha 标为失败。
 - batch parent、child 和 single simulation 的状态抓取会对临时 HTTP、JSON 解析、空响应问题做有限重试，避免一次抓取不到就写成回测失败。
 - `TIMEOUT`、`BATCH_SPAWN_FAILED`、限流/队列类 `SUBMISSION_FAILED` 会标为 `sim_retryable`，可用 `retry-sim --run-id <run_id>` 只重跑这些平台型失败。
 
@@ -465,6 +466,7 @@ make/enhance prompt 只读取 approved lessons，不读取未批准的 forum lea
 - 每条 lesson 只带 compact summary、top lessons、top patterns、top pitfalls、top updates。
 - 默认预算由 `APPROVED_FORUM_LESSONS_MAX_CHARS` 控制。
 - 默认条数由 `APPROVED_FORUM_LESSONS_LIMIT` 控制。
+- 模板构造类经验会额外被折叠成 `BRAIN_AGENT_RESEARCH_POLICY_JSON`，作为结构化研究策略传入 make prompt：偏向模板结构、单数据集假设和 8+ 变体批次，而不是把帖子原文硬编码进生成器。
 - enhance diagnostics 只注入少量候选，并截断 expression、error、reason 和 repair hints。
 - 完整 lesson markdown 仍保留在磁盘，需要深挖时再显式展开。
 

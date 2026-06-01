@@ -44,11 +44,62 @@ def prompt_versions_from_config(config: Any) -> dict[str, str]:
 
 def prompt_env(config: Any) -> dict[str, str]:
     versions = prompt_versions_from_config(config)
+    research_policy = {
+        "mode": "template_guided",
+        "policy_version": "forum-template-v1",
+        "template_discipline": [
+            "Start from reusable alpha template structures, then fill them with target-dataset fields.",
+            "Generate several related variants per thesis instead of one-off raw signals.",
+            "Keep each expression tied to one economic hypothesis and one target dataset unless the user explicitly asks for cross-dataset work.",
+            "Pre-check operator availability and field compatibility before relying on a template family.",
+            "Prefer trading-calendar windows with economic meaning: 5, 22, 66, 120, 252, 504.",
+        ],
+        "dataset_template_routing": {
+            "price_volume": ["turnover_stability", "short_reversal", "volume_price_correlation", "decayed_momentum"],
+            "fundamental": ["profit_to_size", "time_series_then_group_rank", "standardized_backfill", "double_neutralization"],
+            "analyst": ["vector_aggregation", "analyst_revision", "momentum_residualized_analyst", "coverage_filter"],
+            "news_sentiment": ["positive_minus_negative_sentiment", "sentiment_regression_residual", "conditional_sentiment_filter"],
+            "option": ["put_call_greek_spread", "option_price_to_close", "implied_vs_realized_volatility"],
+            "macro": ["to_nan_backfill_quantile", "time_series_then_cross_section"],
+        },
+        "diversity_targets": {
+            "min_variants_per_batch": 8,
+            "avoid_dominating_operator_family": True,
+            "prefer_multiple_structural_themes": True,
+            "vary_field_operator_window_and_neutralization": True,
+        },
+        "quality_floor": {
+            "do_not_lower_standards_after_failures": True,
+            "treat_low_margin_or_low_fitness_as_repair_objectives": True,
+            "direction_may_need_sign_flip_after_empirical_test": True,
+            "reject_factory_shaped_or_long_flat_pnl_candidates": True,
+        },
+        "data_handling": {
+            "sparse_or_macro_fields": ["to_nan", "ts_backfill", "ts_quantile before winsorize when appropriate"],
+            "low_frequency_fields": ["ts_backfill", "winsorize_or_quantile", "time_series_then_cross_section"],
+            "vector_fields": ["vec_avg", "vec_sum", "vec_count before ts/group operations"],
+        },
+        "neutralization_hints": {
+            "fundamental_or_analyst": ["SLOW", "STATISTICAL"],
+            "news_or_sentiment": ["FAST", "SLOW_AND_FAST"],
+            "option_or_macro": ["MARKET", "SLOW_AND_FAST"],
+            "institutions": ["CROWDING", "REVERSION_AND_MOMENTUM"],
+            "short_interest": ["SLOW", "CROWDING"],
+        },
+        "high_signal_template_archetypes": [
+            "profit_to_size_ratio",
+            "market_cap_bucket_then_industry_neutralization",
+            "turnover_stability_reversal",
+            "macro_to_nan_backfill_quantile",
+            "news_sentiment_regression_residual",
+        ],
+    }
     return {
         "BRAIN_AGENT_MAKE_PROMPT_VERSION": versions["make_prompt_version"],
         "BRAIN_AGENT_ENHANCE_PROMPT_VERSION": versions["enhance_prompt_version"],
         "BRAIN_AGENT_DECISION_PROMPT_VERSION": versions["decision_prompt_version"],
         "BRAIN_AGENT_PROMPT_EXPERIMENT": versions["prompt_experiment"],
+        "BRAIN_AGENT_RESEARCH_POLICY_JSON": json.dumps(research_policy, ensure_ascii=False),
         "BRAIN_AGENT_FACTOR_THESIS_FIRST": "1",
         "BRAIN_AGENT_FACTOR_THESIS_SCHEMA": json.dumps(
             {

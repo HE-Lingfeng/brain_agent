@@ -32,6 +32,7 @@ from brain_agent.forum import analyze_forum_post, analyze_search_results, summar
 from brain_agent.knowledge import approve_forum_lesson, load_forum_learning_report, render_approved_lessons_prompt
 from brain_agent.memory import AlphaMemory, build_scoring_context, extract_field_families, extract_operators
 from brain_agent.models import AdapterResult, CandidateStatus, RunConfig
+from brain_agent.prompting import prompt_env
 from brain_agent.quota_allocator import allocate_simulation_quota
 from brain_agent.repository import Repository
 from brain_agent.runtime import ensure_runtime, get_runtime_paths
@@ -1709,6 +1710,36 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual((1, 1, 4, 4, 10, 4), normalize("GLB", batch_size=-2, concurrency=-3))
         self.assertEqual(30 * 60, simulator.parent_wait_seconds)
         self.assertEqual(60 * 60, simulator.child_wait_seconds)
+        self.assertEqual(15 * 60, simulator.stale_healthcheck_seconds)
+
+    def test_batch_simulator_stale_healthcheck_refreshes_session(self) -> None:
+        batch_simulator = _load_batch_simulator_module()
+        simulator = batch_simulator.BatchSimulator(session="old", output_csv=str(self.root / "sim_status.csv"))
+        simulator.stale_healthcheck_seconds = 1
+        marker = {"started_at": 100.0, "next_at": 100.0, "count": 0}
+
+        with patch.object(batch_simulator.time, "time", return_value=120.0):
+            with patch.object(batch_simulator.ace_lib, "start_session", return_value="new") as start_session:
+                simulator._maybe_run_stale_healthcheck(marker, context="unit", status_summary="status=IN_PROGRESS")
+
+        self.assertEqual("new", simulator.session)
+        self.assertEqual(1, marker["count"])
+        self.assertEqual(121.0, marker["next_at"])
+        start_session.assert_called_once()
+
+    def test_prompt_env_exports_template_research_policy(self) -> None:
+        env = prompt_env(self.config)
+        policy = json.loads(env["BRAIN_AGENT_RESEARCH_POLICY_JSON"])
+        self.assertEqual("template_guided", policy["mode"])
+        self.assertEqual(8, policy["diversity_targets"]["min_variants_per_batch"])
+        self.assertIn("macro", policy["dataset_template_routing"])
+        self.assertIn("profit_to_size_ratio", policy["high_signal_template_archetypes"])
+
+        make_pipeline = _load_make_pipeline_module()
+        section = make_pipeline.render_research_policy_section(policy)
+        self.assertIn("BRAIN Agent Research Policy", section)
+        self.assertIn("template_guided", section)
+        self.assertIn("dataset_template_routing", section)
 
     def test_forum_post_analysis_extracts_brain_terms(self) -> None:
         payload = {
@@ -2083,6 +2114,83 @@ Query: turnover
         learning = payload["llm_learning"]
         self.assertEqual(["经验一"], learning["experience_lessons"])
         self.assertEqual("优化提示词", learning["proposed_system_updates"][0]["title"])
+
+    def test_forum_learning_report_with_bad_machine_json_falls_back_to_markdown(self) -> None:
+        report = self.root / "bad_machine_json_forum_learning.md"
+        report.write_text(
+            """# BRAIN Forum Learn
+
+Query: alpha template
+
+## Summary
+模板总结
+
+## Experience Lessons
+- 只使用模板变体。
+
+## Alpha Research Patterns
+- 模板填充模式。
+
+## Pitfalls
+- 不要裸信号乱试。
+
+## Proposed System Updates
+- 集成模板库驱动的自动化流水线 [pending]
+  target: generate
+  change: 走模板策略
+  risk: 模板过拟合
+
+## Machine Readable
+```json brain_agent_forum_learning_payload
+{"llm_learning": {"summary_cn": "bad
+```
+""",
+            encoding="utf-8",
+        )
+        payload = load_forum_learning_report(report)
+        learning = payload["llm_learning"]
+        self.assertEqual("alpha template", payload["query"])
+        self.assertEqual(["只使用模板变体。"], learning["experience_lessons"])
+        self.assertEqual("集成模板库驱动的自动化流水线", learning["proposed_system_updates"][0]["title"])
+
+    def test_template_library_report_normalizes_generic_machine_json(self) -> None:
+        report = self.root / "alpha_templates.md"
+        report.write_text(
+            """# BRAIN Forum Alpha Template Library
+
+## 实战经验精华
+- 经济学时间窗口
+- get_operators 权限
+- to_nan + ts_quantile
+- 厂字形
+
+## Machine Readable (JSON)
+```json
+{
+  "approval_required": true,
+  "total_templates": 44,
+  "template_categories": {
+    "macro": {"count": 1, "range": "TPL-MACRO-001"}
+  },
+  "key_insights": [
+    "Macro数据处理: to_nan + ts_backfill + ts_quantile 优于直接winsorize"
+  ],
+  "top_rated_templates": [
+    "TPL-MACRO-001: Macro泛化"
+  ]
+}
+```
+""",
+            encoding="utf-8",
+        )
+
+        payload = load_forum_learning_report(report)
+        learning = payload["llm_learning"]
+
+        self.assertEqual("template_library", learning["source_report_type"])
+        self.assertEqual("吸纳高票论坛Alpha模板库", learning["proposed_system_updates"][0]["title"])
+        self.assertIn("TPL-MACRO-001: Macro泛化", learning["alpha_research_patterns"])
+        self.assertTrue(any("factory-shaped" in item for item in learning["pitfalls"]))
 
     def test_knowledge_cli_approves_forum_lesson(self) -> None:
         report = self.root / "forum_learning.json"

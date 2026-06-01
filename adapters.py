@@ -731,6 +731,8 @@ class BatchSimAdapter(SkillAdapter):
             str(config.batch_size),
             "--concurrency",
             str(config.concurrency),
+            "--stale-healthcheck-minutes",
+            "15",
         ]
         _, returncode = self.run_command(self.name, cmd, skill_root, env=env)
         if returncode != 0 and not output_csv.exists():

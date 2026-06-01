@@ -179,7 +179,7 @@ Defaults are intentionally conservative to reduce BRAIN rate limits:
 | Non-GLB | 8 | 10 | 80 |
 | GLB | 4 | 4 | 16 |
 
-Override with `--concurrency` and `--batch-size`. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish.
+Override with `--concurrency` and `--batch-size`. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish. During long platform waits, the simulator refreshes BRAIN authentication every 15 minutes and keeps polling; this is a defensive health check, not a failed-alpha signal.
 
 ### Retry Failed Simulations
 
@@ -308,6 +308,10 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime knowledge app
 
 Approved lessons are injected into make/enhance prompts with compact summaries. The knowledge base lives at `brain_agent/knowledge/approved_forum_lessons/`.
 
+Template-construction lessons are also represented as structured research policy (`BRAIN_AGENT_RESEARCH_POLICY_JSON`) in the maintained generation path. This steers the generator toward reusable template structures, dataset-category template routing, operator prechecks, meaningful trading windows, neutralization hints, sparse-data handling, and diversified 8+ variant batches without granting any automatic submission permission.
+
+Template-library reports with a generic `## Machine Readable (JSON)` block can be approved through the same command. They are normalized into compact approved lessons instead of copying the full forum template text into prompts.
+
 ## Submit Gate
 
 ```bash
@@ -406,7 +410,7 @@ Avoid running another BRAIN simulation tool concurrently with `brain_agent` batc
 If a batch simulation appears stuck:
 1. Run `brain_agent tasks --refresh`.
 2. Read the `batchSim` task stdout/stderr logs.
-3. Look for `[BRAIN wait]` messages.
+3. Look for `[BRAIN wait]` and `[BRAIN healthcheck]` messages.
 4. Decide whether to keep waiting, cancel, retry, or resume.
 
 ## Submission Safety

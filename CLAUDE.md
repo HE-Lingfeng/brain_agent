@@ -2,9 +2,9 @@
 
 This repository's long-term maintained automation layer is `brain_agent`.
 
-## Skills
+## Claude Code Skills
 
-For BRAIN alpha mining workflows, use the project skills under `.claude/skills/`:
+Claude Code users should prefer the project skills under `.claude/skills/`:
 
 | Skill | Use When |
 |---|---|
@@ -19,11 +19,11 @@ Prefer `/brain-agent` as the default orchestrator for end-to-end workflows. Use 
 
 ## Tool Routing
 
-Use `brain_agent` as the entry point for BRAIN alpha mining, pipeline management, and reporting:
+Use `brain_agent` as the default entry point for any end-to-end WorldQuant BRAIN alpha mining workflow:
 
 - Generate alpha ideas and expressions
 - Build alpha lists with canonical simulation settings
-- Run batch simulations orchestrated by brain_agent
+- Run batch simulations
 - Resume, retry, cancel, or inspect pipeline tasks
 - Track artifacts, candidates, metrics, reports, and gate results
 - Maintain or improve the pipeline code
@@ -41,9 +41,21 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker --run-
 
 Do not use `brain-mcp` in this repository. Route BRAIN platform queries, simulations, reports, retries, and gate checks through `brain_agent` so all activity is recorded under `.brain_runtime`, `brain_agent.sqlite3`, run reports, and candidate tracking.
 
+## Forum Knowledge And Template Policy
+
+Forum learning reports under `.brain_runtime/forum_learning/` are review artifacts only. Do not treat them as active system knowledge until the user approves a specific proposal with:
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime knowledge approve-forum-lesson \
+  --report <report_path> \
+  --title <proposal_title>
+```
+
+Approved lessons are injected through the existing compact knowledge path and may also be folded into `BRAIN_AGENT_RESEARCH_POLICY_JSON`. Template-construction lessons should guide the generator toward reusable template structures, dataset-category template routing, operator prechecks, meaningful trading windows, neutralization hints, sparse-data handling, single-dataset economic theses, and diversified 8+ variant batches. Template-library reports with a generic `## Machine Readable (JSON)` block are normalized into compact approved lessons. Do not paste forum text directly into prompts or code when a structured policy or approved lesson can represent the experience.
+
 ## Long-Run Simulation Mode
 
-For unattended quota-draining runs, prefer `/brain-agent` with `worker --mode drain` over repeatedly resuming short interactive runs:
+For unattended quota-draining runs, prefer `worker --mode drain` over repeatedly asking an assistant to resume individual CLI runs:
 
 ```bash
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
@@ -70,10 +82,10 @@ If a batch simulation appears stuck:
 
 1. Use `brain_agent tasks --refresh`.
 2. Read the `batchSim` task stdout/stderr logs.
-3. Look for `[BRAIN wait]` messages.
+3. Look for `[BRAIN wait]` and `[BRAIN healthcheck]` messages.
 4. Decide whether to keep waiting, cancel, retry, or resume.
 
-Batch simulation status fetches are intentionally defensive: parent, child, and single-simulation polling should retry transient HTTP, JSON parsing, or empty-response reads before recording a simulation failure. Do not treat one failed status fetch as a failed alpha.
+Batch simulation status fetches are intentionally defensive: parent, child, and single-simulation polling should retry transient HTTP, JSON parsing, or empty-response reads before recording a simulation failure. Long waits trigger a 15-minute session health check and authentication refresh before polling continues. Do not treat one failed status fetch, one `[BRAIN wait]`, or one `[BRAIN healthcheck]` as a failed alpha.
 
 ## Maintenance Preference
 
