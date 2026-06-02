@@ -8,6 +8,7 @@ from typing import Any
 
 from .repository import Repository
 from .task_runner import TaskRunner
+from .utils import expression_fingerprint
 
 
 TERMINAL_STATUSES = {"COMPLETE", "COMPLETED", "ERROR", "FAIL", "FAILED", "TIMEOUT", "SUBMISSION_FAILED", "BATCH_SPAWN_FAILED"}
@@ -30,8 +31,9 @@ def build_simulation_progress(repo: Repository, run_id: str, run_dir: Path) -> d
     if alpha_json is not None and not alpha_json.exists():
         alpha_json = None
 
+    batch_fingerprints = _alpha_json_fingerprints(alpha_json) if alpha_json else set()
     total = _count_alpha_json(alpha_json) if alpha_json else 0
-    csv_summary = _summarize_status_csv(output_csv)
+    csv_summary = _summarize_status_csv(output_csv, fingerprints=batch_fingerprints)
     if total <= 0:
         total = csv_summary["unique_fingerprints"] or csv_summary["rows"]
 
@@ -170,15 +172,18 @@ def _count_alpha_json(path: Path | None) -> int:
     return 0
 
 
-def _summarize_status_csv(path: Path | None) -> dict[str, Any]:
+def _summarize_status_csv(path: Path | None, *, fingerprints: set[str] | None = None) -> dict[str, Any]:
     status_by_fp: dict[str, str] = {}
     rows = 0
+    fingerprints = fingerprints or set()
     if path and path.exists():
         try:
             with path.open("r", encoding="utf-8", newline="") as f:
                 for row in csv.DictReader(f):
                     rows += 1
                     fp = row.get("fingerprint") or row.get("simulation_fingerprint") or row.get("sim_id") or str(rows)
+                    if fingerprints and not _row_matches_fingerprints(row, str(fp), fingerprints):
+                        continue
                     status_by_fp[str(fp)] = str(row.get("status") or "UNKNOWN").upper()
         except Exception:
             pass
@@ -196,6 +201,97 @@ def _summarize_status_csv(path: Path | None) -> dict[str, Any]:
         "failed": failed,
         "terminal": terminal,
     }
+
+
+def _alpha_json_fingerprints(path: Path | None) -> set[str]:
+    rows = _alpha_json_rows(path)
+    fingerprints: set[str] = set()
+    for row in rows:
+        expression = _expression_from_alpha_row(row)
+        if not expression:
+            continue
+        settings = row.get("settings") if isinstance(row, dict) and isinstance(row.get("settings"), dict) else {}
+        fingerprints.add(expression_fingerprint(expression))
+        fingerprints.add(expression_fingerprint(expression, _canonical_settings(settings)))
+    return fingerprints
+
+
+def _alpha_json_rows(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in ("alphas", "alpha_list", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def _expression_from_alpha_row(row: dict[str, Any]) -> str:
+    return str(row.get("regular") or row.get("expression") or row.get("regular_expression") or "")
+
+
+def _row_matches_fingerprints(row: dict[str, Any], fp: str, fingerprints: set[str]) -> bool:
+    if fp in fingerprints:
+        return True
+    expression = str(row.get("regular_expression") or row.get("regular") or row.get("expression") or "")
+    if not expression:
+        return False
+    settings = _json_obj(row.get("settings_json"))
+    return expression_fingerprint(expression) in fingerprints or expression_fingerprint(
+        expression,
+        _canonical_settings(settings),
+    ) in fingerprints
+
+
+def _json_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _canonical_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
+    if not settings:
+        return {}
+    lowered = {str(k).lower(): v for k, v in settings.items()}
+    aliases = {
+        "instrumentType": ("instrumenttype", "instrument_type"),
+        "region": ("region",),
+        "universe": ("universe",),
+        "delay": ("delay",),
+        "decay": ("decay",),
+        "neutralization": ("neutralization",),
+        "truncation": ("truncation",),
+        "pasteurization": ("pasteurization",),
+        "testPeriod": ("testperiod", "test_period"),
+        "unitHandling": ("unithandling", "unit_handling"),
+        "nanHandling": ("nanhandling", "nan_handling"),
+        "maxTrade": ("maxtrade", "max_trade"),
+        "language": ("language",),
+        "visualization": ("visualization",),
+    }
+    canonical: dict[str, Any] = {}
+    for key, names in aliases.items():
+        for name in names:
+            if name in lowered:
+                value = lowered[name]
+                if key in {"region", "universe", "neutralization", "maxTrade", "language"} and isinstance(value, str):
+                    value = value.upper()
+                canonical[key] = value
+                break
+    return canonical
 
 
 def _latest_wait_line(task: dict[str, Any] | None) -> str:
