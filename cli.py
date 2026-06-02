@@ -7,13 +7,20 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from .adapters import BatchSimAdapter, InspectRawTemplateAdapter, MakeSomeGemAdapter, SubmissionGateAdapter, copy_artifact_to_run
+from .adapters import (
+    BatchSimAdapter,
+    InspectRawTemplateAdapter,
+    MakeSomeGemAdapter,
+    SubmissionGateAdapter,
+    copy_artifact_to_run,
+)
 from .controller import BatchLoopController
 from .credentials import load_credentials
 from .forum import DEFAULT_DAILY_LEARNING_QUERIES, ForumService, render_markdown
 from .knowledge import approve_forum_lesson
 from .memory import AlphaMemory, render_memory_summary_markdown
 from .models import CandidateStatus, RunConfig
+from .optimization import run_optimization_pass
 from .prompting import (
     compare_prompt_runs,
     render_prompt_compare_markdown,
@@ -78,6 +85,15 @@ def main(argv: list[str] | None = None) -> int:
     retry_sim_p.add_argument("--concurrency", type=int, default=None)
     retry_sim_p.add_argument("--dry-run", action="store_true", help="Write retry alpha_list and print summary without submitting")
 
+    optimize_p = sub.add_parser("optimize-candidates")
+    optimize_p.add_argument("--run-id", required=True)
+    optimize_p.add_argument("--max-parents", type=int, default=20, help="Maximum simulated parent candidates to tag and optimize")
+    optimize_p.add_argument("--max-variants", type=int, default=100, help="Maximum variant expressions to enqueue")
+    optimize_p.add_argument("--max-variants-per-alpha", type=int, default=None, help="Maximum variants per selected parent")
+    optimize_p.add_argument("--min-score", type=float, default=0.35, help="Minimum selection_score for non-promoted parents")
+    optimize_p.add_argument("--include-child-variants", action="store_true", help="Allow already-derived variants to be optimized again")
+    optimize_p.add_argument("--dry-run", action="store_true", help="Only print selected parents and tags; do not enqueue variants")
+
     worker_p = sub.add_parser("worker")
     worker_p.add_argument("--run-id", required=True)
     worker_p.add_argument("--mode", choices=["drain", "once"], default="drain")
@@ -91,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     worker_p.add_argument("--concurrency", type=int, default=None, help="Override concurrency from run config")
     worker_p.add_argument("--refill-on-empty", action="store_true", help="Generate and inspect new candidates when the simulation queue is empty")
     worker_p.add_argument("--max-empty-refills", type=int, default=3, help="Maximum empty-queue refill attempts in drain mode; 0 means unlimited")
+    worker_p.add_argument("--optimize-every-alphas", type=int, default=500, help="Run a repair-variant optimization pass after every N submitted alphas; 0 disables")
+    worker_p.add_argument("--optimize-max-parents", type=int, default=20, help="Maximum parents selected by each periodic optimization pass")
+    worker_p.add_argument("--optimize-max-variants", type=int, default=100, help="Maximum variants enqueued by each periodic optimization pass")
 
     report_p = sub.add_parser("report")
     report_p.add_argument("--run-id", required=True)
@@ -221,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_resume(args)
     if args.command == "retry-sim":
         return cmd_retry_sim(args)
+    if args.command == "optimize-candidates":
+        return cmd_optimize_candidates(args)
     if args.command == "worker":
         return cmd_worker(args)
     if args.command == "report":
@@ -498,6 +519,35 @@ def cmd_retry_sim(args: argparse.Namespace) -> int:
         repo.close()
 
 
+def cmd_optimize_candidates(args: argparse.Namespace) -> int:
+    paths = get_runtime_paths(args.run_id, args.runtime_root)
+    ensure_runtime(paths)
+    repo = Repository(paths.db_path)
+    try:
+        run = repo.get_run(args.run_id)
+        if not run:
+            print(f"Run not found: {args.run_id}", file=sys.stderr)
+            return 1
+        config = RunConfig(**json.loads(run["config_json"]))
+        payload = run_optimization_pass(
+            repo,
+            args.run_id,
+            paths.run_dir,
+            config,
+            max_parents=int(args.max_parents),
+            max_variants=int(args.max_variants),
+            max_variants_per_alpha=args.max_variants_per_alpha,
+            min_score=float(args.min_score),
+            include_child_variants=bool(args.include_child_variants),
+            source_prefix="manual_optimize",
+            dry_run=bool(args.dry_run),
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if payload.get("status") == "ok" else 1
+    finally:
+        repo.close()
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     paths = get_runtime_paths(args.run_id, args.runtime_root)
     ensure_runtime(paths)
@@ -542,6 +592,9 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 max_candidates_per_batch=limit,
                 refill_on_empty=args.refill_on_empty,
                 max_empty_refills=max_empty_refills,
+                optimize_every_alphas=args.optimize_every_alphas,
+                optimize_max_parents=args.optimize_max_parents,
+                optimize_max_variants=args.optimize_max_variants,
             )
 
         if stats.total_submitted == 0:

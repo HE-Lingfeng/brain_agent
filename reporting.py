@@ -47,7 +47,13 @@ def write_report(repo: Repository, run_id: str, run_dir: Path) -> tuple[Path, Pa
     candidates = result["candidates"]
     sim_by_fp = _latest_by_key(result["sim_results"], "fingerprint")
     gates_by_candidate = _latest_by_key(result["gate_checks"], "candidate_id")
-    ready = [c for c in candidates if c.get("status") == "submit_ready"]
+    ready = _latest_gate_passed_candidates(candidates, gates_by_candidate)
+    ready_candidate_ids = {item.get("candidate_id") for item in ready}
+    stale_ready = [
+        c
+        for c in candidates
+        if c.get("status") == "submit_ready" and c.get("candidate_id") not in ready_candidate_ids
+    ]
     tag_counts = summarize_failure_tags(result["sim_results"])
     research_summary = _research_summary(result, ready, tag_counts)
     variant_comparisons = _variant_comparisons(candidates, result["sim_results"])
@@ -152,10 +158,24 @@ def write_report(repo: Repository, run_id: str, run_dir: Path) -> tuple[Path, Pa
     lines.append("## Submit Ready Alpha IDs")
     if ready:
         for item in ready:
-            lines.append(f"- {item.get('alpha_id') or '<missing alpha_id>'} (candidate_id={item['candidate_id']})")
+            gate = gates_by_candidate.get(item.get("candidate_id")) or {}
+            lines.append(
+                f"- {item.get('alpha_id') or '<missing alpha_id>'} "
+                f"(candidate_id={item['candidate_id']}, gate_checked_at={gate.get('created_at') or '<unknown>'})"
+            )
     else:
         lines.append("- None")
     lines.append("")
+    if stale_ready:
+        lines.append("## Stale Submit Ready Excluded")
+        for item in stale_ready:
+            gate = gates_by_candidate.get(item.get("candidate_id")) or {}
+            lines.append(
+                f"- {item.get('alpha_id') or '<missing alpha_id>'} "
+                f"(candidate_id={item['candidate_id']}, latest_gate_passed={gate.get('passed')}, "
+                f"latest_gate_status={gate.get('gate_status') or '<missing>'})"
+            )
+        lines.append("")
     lines.append("## Suggested Manual Submission Order")
     ordered = sorted(
         ready,
@@ -384,6 +404,23 @@ def _latest_by_key(rows: list[dict[str, Any]], key: str) -> dict[Any, dict[str, 
     for row in rows:
         result[row.get(key)] = row
     return result
+
+
+def _latest_gate_passed_candidates(
+    candidates: list[dict[str, Any]],
+    gates_by_candidate: dict[Any, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ready = []
+    for candidate in candidates:
+        if candidate.get("status") != "submit_ready":
+            continue
+        gate = gates_by_candidate.get(candidate.get("candidate_id")) or {}
+        if int(gate.get("passed") or 0) != 1:
+            continue
+        if str(gate.get("gate_status") or "complete").lower() != "complete":
+            continue
+        ready.append(candidate)
+    return ready
 
 
 def _research_summary(result: dict[str, Any], ready: list[dict[str, Any]], tag_counts: dict[str, int]) -> list[str]:

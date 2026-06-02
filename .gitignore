@@ -36,8 +36,10 @@
 !/selection.py
 !/task_runner.py
 !/thesis.py
+!/optimization.py
 !/utils.py
 !/variant_search.py
+!/worker.py
 !/tests/
 !/tests/test_brain_agent.py
 

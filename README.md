@@ -208,6 +208,19 @@ Each batch is capped to `batch_size * concurrency` candidates by default. `--max
 
 `--refill-on-empty` turns the worker into a closer approximation of a daemon queue: when no `sim_pending` or `sim_retryable` candidates remain, it runs a new `GENERATE -> INSPECT -> field_factory` refill and then keeps draining. `--max-empty-refills` defaults to 3 in drain mode; set it to `0` for unlimited refills during a supervised long run.
 
+Drain mode intentionally does not run variant search or enhancement after every batch. It does run a light periodic optimization checkpoint every 500 submitted alphas by default: the worker scans simulated parents, skips parents already tagged by prior optimization passes, and enqueues repair variants only when useful candidates exist. Set `--optimize-every-alphas 0` to disable, or tune `--optimize-max-parents` / `--optimize-max-variants`.
+
+When you want to review recent simulation evidence yourself and enqueue targeted repairs on demand, run a manual optimization pass:
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime optimize-candidates \
+  --run-id <run_id> \
+  --max-parents 20 \
+  --max-variants 100
+```
+
+`optimize-candidates` selects simulated parents with repairable evidence, writes durable tags such as `repair_low_fitness`, `repair_subuniverse`, `repair_weight_concentration`, `short_flip_candidate`, and `turnover_control_candidate`, then generates lineage-preserving variants as `sim_pending` candidates for the drain worker. Use `--dry-run` to inspect the selected parents and tags without modifying the queue.
+
 ### Simulation Quota Allocator
 
 When `--max-sim-alphas` is set, the quota allocator splits scarce simulation budget across three strategies:
@@ -318,7 +331,7 @@ Template-library reports with a generic `## Machine Readable (JSON)` block can b
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime gate --run-id <run_id>
 ```
 
-Gate checks read platform-backed checks (`/alphas/{id}/check`, falling back to `/alphas/{id}` `is.checks`), plus dedicated self/prod correlation endpoints. Gate failures from transient network/proxy errors are recorded as `gate_status=incomplete` rather than alpha quality failures.
+Gate checks read platform-backed checks (`/alphas/{id}/check`, falling back to `/alphas/{id}` `is.checks`), plus dedicated self/prod correlation endpoints. Existing `submit_ready` candidates are rechecked by real gate runs; a complete gate failure revokes stale submit-ready status. Reports only list manual-submission candidates whose latest gate row is complete and passed. Gate failures from transient network/proxy errors are recorded as `gate_status=incomplete` rather than alpha quality failures.
 
 Use `--dry-run` for local deterministic mock checks.
 

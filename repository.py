@@ -109,6 +109,16 @@ CREATE TABLE IF NOT EXISTS decisions (
   input_candidates_json TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS candidate_tags (
+  tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  candidate_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  source TEXT DEFAULT '',
+  metadata_json TEXT DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, candidate_id, tag, source)
+);
 """
 
 
@@ -140,6 +150,8 @@ class Repository:
         self._ensure_column("gate_checks", "error_type", "TEXT DEFAULT ''")
         self._ensure_column("gate_checks", "incomplete_checks", "TEXT DEFAULT ''")
         self._ensure_column("gate_checks", "error", "TEXT DEFAULT ''")
+        self._ensure_column("candidate_tags", "source", "TEXT DEFAULT ''")
+        self._ensure_column("candidate_tags", "metadata_json", "TEXT DEFAULT '{}'")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
@@ -400,6 +412,44 @@ class Repository:
         )
         self.conn.commit()
 
+    def add_candidate_tag(
+        self,
+        run_id: str,
+        candidate_id: int,
+        tag: str,
+        *,
+        source: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO candidate_tags(run_id, candidate_id, tag, source, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                int(candidate_id),
+                str(tag),
+                str(source or ""),
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                now_iso(),
+            ),
+        )
+        self.conn.commit()
+
+    def list_candidate_tags(self, run_id: str, candidate_id: int | None = None) -> list[dict[str, Any]]:
+        if candidate_id is None:
+            rows = self.conn.execute(
+                "SELECT * FROM candidate_tags WHERE run_id = ? ORDER BY tag_id",
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM candidate_tags WHERE run_id = ? AND candidate_id = ? ORDER BY tag_id",
+                (run_id, int(candidate_id)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_sim_results_by_candidate(self, run_id: str) -> dict[int, dict[str, Any]]:
         rows = self.conn.execute(
             """
@@ -417,7 +467,7 @@ class Repository:
         return result
 
     def list_rows(self, table: str, run_id: str) -> list[dict[str, Any]]:
-        if table not in {"runs", "tasks", "artifacts", "candidates", "sim_results", "gate_checks", "decisions"}:
+        if table not in {"runs", "tasks", "artifacts", "candidates", "sim_results", "gate_checks", "decisions", "candidate_tags"}:
             raise ValueError(f"Unsupported table: {table}")
         if table == "runs":
             rows = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchall()

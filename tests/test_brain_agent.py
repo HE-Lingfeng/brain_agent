@@ -32,8 +32,10 @@ from brain_agent.forum import analyze_forum_post, analyze_search_results, summar
 from brain_agent.knowledge import approve_forum_lesson, load_forum_learning_report, render_approved_lessons_prompt
 from brain_agent.memory import AlphaMemory, build_scoring_context, extract_field_families, extract_operators
 from brain_agent.models import AdapterResult, CandidateStatus, RunConfig
+from brain_agent.optimization import optimization_tags, select_optimization_parents
 from brain_agent.prompting import prompt_env
 from brain_agent.quota_allocator import allocate_simulation_quota
+from brain_agent.reporting import write_report
 from brain_agent.repository import Repository
 from brain_agent.runtime import ensure_runtime, get_runtime_paths
 from brain_agent.scoring import score_candidate
@@ -1279,6 +1281,87 @@ class BrainAgentTests(unittest.TestCase):
         self.assertIn("reduce_self_correlation", breakdown["repair_objectives"])
         self.assertFalse(breakdown["gate_passed"])
 
+    def test_submission_gate_rechecks_and_revokes_stale_submit_ready(self) -> None:
+        fp = expression_fingerprint("rank(close)")
+        self.repo.upsert_candidate(
+            "test_run",
+            "rank(close)",
+            fp,
+            status="submit_ready",
+            alpha_id="A123",
+        )
+
+        class FakeFrame:
+            empty = False
+
+            def __init__(self, records):
+                self.records = records
+
+            def to_dict(self, orient):
+                return self.records
+
+        fake_ace = types.SimpleNamespace(
+            start_session=lambda: object(),
+            get_check_submission=lambda session, alpha_id: FakeFrame(
+                [
+                    {"test": "SHARPE", "result": "PASS"},
+                    {"test": "FITNESS", "result": "FAIL"},
+                    {"test": "CONCENTRATED_WEIGHT", "result": "PASS"},
+                    {"test": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS"},
+                    {"test": "LOW_2Y_SHARPE", "result": "PASS"},
+                ]
+            ),
+            check_self_corr_test=lambda session, alpha_id: FakeFrame(
+                [{"test": "SELF_CORRELATION", "result": "PASS"}]
+            ),
+            check_prod_corr_test=lambda session, alpha_id: FakeFrame(
+                [{"test": "PROD_CORRELATION", "result": "PASS"}]
+            ),
+        )
+
+        with patch.dict(os.environ, {"BRAIN_EMAIL": "env@example.com", "BRAIN_PASSWORD": "env_pw"}, clear=False):
+            with patch.dict(sys.modules, {"ace_lib": fake_ace}):
+                result = SubmissionGateAdapter(self.repo, "test_run", self.paths.run_dir).run_real()
+
+        self.assertEqual("ok", result.status)
+        candidate = self.repo.list_rows("candidates", "test_run")[0]
+        self.assertEqual("manual_review", candidate["status"])
+        gate = self.repo.list_rows("gate_checks", "test_run")[0]
+        self.assertEqual(0, gate["passed"])
+        self.assertEqual("FAIL", gate["submission_check"])
+
+    def test_report_excludes_submit_ready_without_latest_gate_pass(self) -> None:
+        fp = expression_fingerprint("rank(close)")
+        cid = self.repo.upsert_candidate(
+            "test_run",
+            "rank(close)",
+            fp,
+            status="submit_ready",
+            alpha_id="A123",
+        )
+        self.repo.add_gate_check(
+            "test_run",
+            {
+                "candidate_id": cid,
+                "alpha_id": "A123",
+                "submission_check": "FAIL",
+                "self_corr_check": "PASS",
+                "prod_corr_check": "PASS",
+                "weight_check": "PASS",
+                "subuniverse_check": "PASS",
+                "gate_status": "complete",
+                "passed": False,
+            },
+        )
+
+        md_path, _ = write_report(self.repo, "test_run", self.paths.run_dir)
+        text = md_path.read_text(encoding="utf-8")
+
+        self.assertIn("## Submit Ready Alpha IDs\n- None", text)
+        self.assertIn("## Stale Submit Ready Excluded", text)
+        self.assertIn("latest_gate_passed=0", text)
+        self.assertIn("No candidates are ready for manual submission.", text)
+
     def test_credentials_env_overrides_secret(self) -> None:
         secret = self.root / "secret.json"
         write_json(secret, {"brain": {"email": "secret@example.com", "password": "secret_pw"}})
@@ -1533,6 +1616,86 @@ class BrainAgentTests(unittest.TestCase):
         )
         self.assertIn(2, actions[0].candidate_ids)
 
+    def test_optimization_tags_identify_repair_targets(self) -> None:
+        tags = optimization_tags(
+            {"status": "needs_enhance"},
+            {
+                "sharpe": 0.72,
+                "fitness": 0.91,
+                "turnover": 0.4,
+                "failure_tags": "low_fitness,subuniverse_issue",
+                "repair_objectives": "improve_fitness",
+            },
+            {"weight_check": "FAIL"},
+        )
+        self.assertIn("repair_low_fitness", tags)
+        self.assertIn("repair_low_sharpe", tags)
+        self.assertIn("repair_subuniverse", tags)
+        self.assertIn("turnover_control_candidate", tags)
+        self.assertIn("repair_weight_concentration", tags)
+
+    def test_optimize_candidates_cli_tags_and_enqueues_variants(self) -> None:
+        expression = "ts_mean(rank(analyst7_field_a), 20)"
+        fp = expression_fingerprint(expression)
+        candidate_id = self.repo.upsert_candidate(
+            "test_run",
+            expression,
+            fp,
+            status=CandidateStatus.NEEDS_ENHANCE.value,
+            source="unit",
+        )
+        self.repo.add_sim_result(
+            "test_run",
+            {
+                "candidate_id": candidate_id,
+                "fingerprint": fp,
+                "simulation_fingerprint": fp,
+                "alpha_id": "OPT1",
+                "sim_id": "SIM1",
+                "status": "COMPLETE",
+                "sharpe": 0.7,
+                "fitness": 0.72,
+                "turnover": 0.22,
+                "failure_tags": ["low_fitness", "low_sharpe"],
+                "repair_objectives": ["improve_fitness", "improve_sharpe"],
+            },
+        )
+        self.repo.update_candidate_score("test_run", candidate_id, 0.82, {"unit": True})
+
+        selected = select_optimization_parents(self.repo, "test_run", max_parents=5)
+        self.assertEqual([candidate_id], [int(row["candidate_id"]) for row in selected])
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = main(
+                [
+                    "--runtime-root",
+                    str(self.root),
+                    "optimize-candidates",
+                    "--run-id",
+                    "test_run",
+                    "--max-parents",
+                    "5",
+                    "--max-variants",
+                    "8",
+                ]
+            )
+        self.assertEqual(0, code)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(1, payload["selected_parent_count"])
+        self.assertGreater(payload["variant_count"], 0)
+
+        tag_names = {row["tag"] for row in self.repo.list_candidate_tags("test_run", candidate_id)}
+        self.assertIn("repair_low_fitness", tag_names)
+        variant_rows = [
+            row
+            for row in self.repo.list_rows("candidates", "test_run")
+            if row.get("parent_candidate_id") == candidate_id
+        ]
+        self.assertTrue(variant_rows)
+        self.assertTrue(all(row["status"] == CandidateStatus.SIM_PENDING.value for row in variant_rows))
+        decisions = self.repo.list_rows("decisions", "test_run")
+        self.assertTrue(any("manual_optimize_candidates" in row["action"] for row in decisions))
+
     def test_decision_llm_parser_accepts_fenced_and_wrapped_json(self) -> None:
         fenced = """```json
         [{"mode":"single","style":"balanced","candidate_ids":[2],"reason":"ok"}]
@@ -1695,6 +1858,69 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual(1, stats.total_submitted)
         rows = self.repo.find_candidates_by_status("test_run", [CandidateStatus.SIM_PENDING.value])
         self.assertEqual(["rank(ts_mean(price_close, 20))"], [row["expression"] for row in rows])
+
+    def test_worker_periodic_optimization_enqueues_variants_every_threshold(self) -> None:
+        parent_expr = "ts_mean(rank(analyst7_field_a), 20)"
+        parent_fp = expression_fingerprint(parent_expr)
+        parent_id = self.repo.upsert_candidate(
+            "test_run",
+            parent_expr,
+            parent_fp,
+            status=CandidateStatus.NEEDS_ENHANCE.value,
+            source="unit",
+        )
+        self.repo.add_sim_result(
+            "test_run",
+            {
+                "candidate_id": parent_id,
+                "fingerprint": parent_fp,
+                "simulation_fingerprint": parent_fp,
+                "alpha_id": "AUTOOPT1",
+                "sim_id": "SIM_AUTOOPT1",
+                "status": "COMPLETE",
+                "sharpe": 0.8,
+                "fitness": 0.72,
+                "turnover": 0.2,
+                "failure_tags": ["low_fitness", "low_sharpe"],
+                "repair_objectives": ["improve_fitness", "improve_sharpe"],
+            },
+        )
+        self.repo.update_candidate_score("test_run", parent_id, 0.86, {"unit": True})
+        for idx in range(500):
+            expr = f"rank(analyst7_pending_{idx})"
+            self.repo.upsert_candidate(
+                "test_run",
+                expr,
+                expression_fingerprint(expr),
+                status=CandidateStatus.SIM_PENDING.value,
+                source="unit_pending",
+            )
+
+        with patch.object(
+            BatchSimAdapter,
+            "run_real",
+            return_value=AdapterResult(status="ok", metrics_delta=[{"status": "COMPLETE"} for _ in range(500)]),
+        ):
+            stats = SimulationWorker(self.repo, "test_run", self.paths, self.config).run_drain(
+                max_batches=1,
+                max_candidates_per_batch=500,
+                optimize_every_alphas=500,
+                optimize_max_parents=5,
+                optimize_max_variants=8,
+            )
+
+        self.assertEqual(500, stats.total_submitted)
+        self.assertEqual(1, stats.optimization_passes)
+        self.assertGreater(stats.optimization_variants, 0)
+        tag_rows = self.repo.list_candidate_tags("test_run", parent_id)
+        self.assertTrue(any(row["source"].startswith("auto_optimize:") for row in tag_rows))
+        variants = [
+            row
+            for row in self.repo.list_rows("candidates", "test_run")
+            if row.get("parent_candidate_id") == parent_id
+        ]
+        self.assertTrue(variants)
+        self.assertTrue(all(row["status"] == CandidateStatus.SIM_PENDING.value for row in variants))
 
     def test_batch_simulator_slot_limits_are_region_aware(self) -> None:
         batch_simulator = _load_batch_simulator_module()

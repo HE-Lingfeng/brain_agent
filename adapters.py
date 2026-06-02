@@ -1149,6 +1149,7 @@ class SubmissionGateAdapter(SkillAdapter):
             r
             for r in self.repo.list_rows("candidates", self.run_id)
             if r.get("alpha_id") and r.get("status") in {
+                CandidateStatus.SUBMIT_READY.value,
                 CandidateStatus.MANUAL_REVIEW.value,
                 CandidateStatus.PROMISING.value,
             }
@@ -1192,6 +1193,8 @@ class SubmissionGateAdapter(SkillAdapter):
                     self.repo.update_candidate_score(self.run_id, candidate_id, score.score, score.breakdown)
                 if gate.get("passed"):
                     self.repo.update_candidate_status(self.run_id, row["fingerprint"], CandidateStatus.SUBMIT_READY.value)
+                elif _should_revoke_submit_ready(row, gate):
+                    self.repo.update_candidate_status(self.run_id, row["fingerprint"], CandidateStatus.MANUAL_REVIEW.value)
                 gate_rows.append(gate)
         except Exception as exc:
             gate_rows = [_gate_error_row(row, exc, ["gate_runtime"]) for row in rows]
@@ -1997,6 +2000,14 @@ def _submission_gate_records(ace_lib: Any, session: Any, alpha_id: str) -> tuple
         joined = "; ".join(part for part in [f"/check: {primary_error}", f"/alphas: {detail_error}" if detail_error else ""] if part)
         return [], joined[:500]
     return [], ""
+
+
+def _should_revoke_submit_ready(candidate: dict[str, Any], gate: dict[str, Any]) -> bool:
+    if str(candidate.get("status") or "") != CandidateStatus.SUBMIT_READY.value:
+        return False
+    if str(gate.get("gate_status") or "").lower() == "incomplete":
+        return False
+    return not bool(gate.get("passed"))
 
 
 def _alpha_detail_submission_checks(session: Any, alpha_id: str, base_url: str) -> list[dict[str, Any]]:
