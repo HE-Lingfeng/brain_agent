@@ -1693,6 +1693,7 @@ class BrainAgentTests(unittest.TestCase):
         ]
         self.assertTrue(variant_rows)
         self.assertTrue(all(row["status"] == CandidateStatus.SIM_PENDING.value for row in variant_rows))
+        self.assertTrue(all(int(row["queue_priority"] or 0) == 100 for row in variant_rows))
         decisions = self.repo.list_rows("decisions", "test_run")
         self.assertTrue(any("manual_optimize_candidates" in row["action"] for row in decisions))
 
@@ -1921,6 +1922,34 @@ class BrainAgentTests(unittest.TestCase):
         ]
         self.assertTrue(variants)
         self.assertTrue(all(row["status"] == CandidateStatus.SIM_PENDING.value for row in variants))
+        self.assertTrue(all(int(row["queue_priority"] or 0) == 100 for row in variants))
+
+    def test_worker_prioritizes_optimization_variants_without_dropping_pending(self) -> None:
+        ordinary_expr = "rank(analyst7_ordinary)"
+        ordinary_id = self.repo.upsert_candidate(
+            "test_run",
+            ordinary_expr,
+            expression_fingerprint(ordinary_expr),
+            status=CandidateStatus.SIM_PENDING.value,
+            source="unit_pending",
+        )
+        variant_expr = "rank(ts_mean(analyst7_variant, 20))"
+        variant_id = self.repo.upsert_candidate(
+            "test_run",
+            variant_expr,
+            expression_fingerprint(variant_expr),
+            status=CandidateStatus.SIM_PENDING.value,
+            source="variant_search",
+            parent_candidate_id=ordinary_id,
+        )
+        self.repo.update_candidate_score("test_run", ordinary_id, 0.99, {"unit": "ordinary"})
+        self.repo.update_candidate_score("test_run", variant_id, 0.01, {"unit": "variant"})
+        self.repo.update_candidate_queue_priority("test_run", variant_id, 100)
+
+        candidates = SimulationWorker(self.repo, "test_run", self.paths, self.config)._find_pending_candidates()
+
+        self.assertEqual([variant_id, ordinary_id], [int(row["candidate_id"]) for row in candidates])
+        self.assertEqual(2, self.repo.count_candidates("test_run", CandidateStatus.SIM_PENDING.value))
 
     def test_batch_simulator_slot_limits_are_region_aware(self) -> None:
         batch_simulator = _load_batch_simulator_module()

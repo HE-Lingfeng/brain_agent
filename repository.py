@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   alpha_id TEXT,
   status TEXT NOT NULL,
   source TEXT,
+  queue_priority INTEGER DEFAULT 0,
   selection_score REAL DEFAULT 0,
   score_breakdown TEXT DEFAULT '{}',
   parent_candidate_id INTEGER,
@@ -140,6 +141,7 @@ class Repository:
         self._ensure_column("sim_results", "repair_objectives", "TEXT")
         self._ensure_column("sim_results", "diagnosis_json", "TEXT")
         self._ensure_column("candidates", "selection_score", "REAL DEFAULT 0")
+        self._ensure_column("candidates", "queue_priority", "INTEGER DEFAULT 0")
         self._ensure_column("candidates", "score_breakdown", "TEXT DEFAULT '{}'")
         self._ensure_column("candidates", "parent_candidate_id", "INTEGER")
         self._ensure_column("candidates", "variant_strategy", "TEXT DEFAULT ''")
@@ -321,6 +323,17 @@ class Repository:
             WHERE run_id = ? AND candidate_id = ?
             """,
             (float(score), json.dumps(breakdown, ensure_ascii=False), now_iso(), run_id, int(candidate_id)),
+        )
+        self.conn.commit()
+
+    def update_candidate_queue_priority(self, run_id: str, candidate_id: int, queue_priority: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE candidates
+            SET queue_priority = ?, updated_at = ?
+            WHERE run_id = ? AND candidate_id = ?
+            """,
+            (int(queue_priority), now_iso(), run_id, int(candidate_id)),
         )
         self.conn.commit()
 

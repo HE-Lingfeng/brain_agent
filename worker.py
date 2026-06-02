@@ -348,7 +348,11 @@ class SimulationWorker:
             print(f"[worker] retired {retired} candidate(s) after {max_retries} retries (marked SIM_FAILED)")
 
         active.sort(
-            key=lambda r: (float(r.get("selection_score") or 0), int(r.get("candidate_id") or 0)),
+            key=lambda r: (
+                int(r.get("queue_priority") or 0),
+                float(r.get("selection_score") or 0),
+                int(r.get("candidate_id") or 0),
+            ),
             reverse=True,
         )
         if max_results > 0 and len(active) > max_results:

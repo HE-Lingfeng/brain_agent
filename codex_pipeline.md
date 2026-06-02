@@ -269,11 +269,11 @@ SQLite 主要表：
 - `runs`：run 配置、状态和时间。
 - `tasks`：所有 legacy 子进程任务状态。
 - `artifacts`：关键输入输出文件索引、hash、stage。
-- `candidates`：expression-level candidate、来源、状态、selection score。
+- `candidates`：expression-level candidate、来源、状态、`selection_score` 和 worker `queue_priority`。
 - `sim_results`：BRAIN simulation 指标、错误、failure tags、diagnosis。
 - `gate_checks`：submission/self/prod correlation 等 submit gate 检查；submission 检查优先读取 `/alphas/{id}/check`，空结果时回退到 `/alphas/{id}` 的 `is.checks`，并归一化 `CONCENTRATED_WEIGHT`、`LOW_SUB_UNIVERSE_SHARPE`、`LOW_2Y_SHARPE` 等平台页面检查名。`/check` 里的 `SELF_CORRELATION` / `PROD_CORRELATION` 可能保持 `PENDING`，submit-ready 判定以 dedicated self/prod correlation endpoints 为准。真实 gate 会重新检查已有 `submit_ready`，完整 gate 失败会撤销旧 ready；报告的人工提交列表只展示 latest gate complete+passed 的候选。
 - `decisions`：enhance 决策、输入候选和理由。
-- `candidate_tags`：人工触发优化时写入的 durable tags，例如 `repair_low_fitness`、`repair_subuniverse`、`repair_weight_concentration`、`short_flip_candidate`。
+- `candidate_tags`：人工或定期优化时写入的 durable tags，例如 `repair_low_fitness`、`repair_subuniverse`、`repair_weight_concentration`、`short_flip_candidate`。
 
 身份口径：
 
@@ -528,7 +528,7 @@ make/enhance prompt 只读取 approved lessons，不读取未批准的 forum lea
 | `--use-llm-decide` | DECIDE 阶段使用 LLM 生成 enhancement actions |
 | `--max-enhance-actions` | 每轮最多 enhancement actions |
 
-`worker --mode drain` 可对已有 run 非交互持续消耗 `sim_pending` / `sim_retryable` 队列。`--batch-candidates-limit 0` 表示使用 `batch_size * concurrency` 作为每轮候选上限；如果设置 `--max-total-alphas`，worker 会在每轮提交前按剩余额度进一步收紧本轮上限。`--refill-on-empty` 会在队列耗尽时自动执行一次新的 `GENERATE -> INSPECT -> field_factory` 补料，再继续消耗 simulation 队列；`--max-empty-refills 0` 表示长跑期间不限补料次数。drain 模式不在每批回测后自动进入 enhance，但默认每提交 500 个 alpha 会触发一次轻量优化检查；该检查会跳过已打过优化标签的 parent，若存在可修复候选则写入 `candidate_tags` / `decisions` 并把局部变体作为 `sim_pending` 补入队列。可用 `--optimize-every-alphas 0` 关闭，或用 `--optimize-max-parents` / `--optimize-max-variants` 调整预算。需要阶段性人工复盘时，可手动触发 `optimize-candidates --run-id <run_id> --max-parents 20 --max-variants 100`。
+`worker --mode drain` 可对已有 run 非交互持续消耗 `sim_pending` / `sim_retryable` 队列。`--batch-candidates-limit 0` 表示使用 `batch_size * concurrency` 作为每轮候选上限；如果设置 `--max-total-alphas`，worker 会在每轮提交前按剩余额度进一步收紧本轮上限。`--refill-on-empty` 会在队列耗尽时自动执行一次新的 `GENERATE -> INSPECT -> field_factory` 补料，再继续消耗 simulation 队列；`--max-empty-refills 0` 表示长跑期间不限补料次数。drain 模式不在每批回测后自动进入 enhance，但默认每提交 500 个 alpha 会触发一次轻量优化检查；该检查会跳过已打过优化标签的 parent，若存在可修复候选则写入 `candidate_tags` / `decisions` 并把局部变体作为 `sim_pending` 补入队列。原有待回测表达式不会被清空；优化变体会写入更高 `queue_priority`，下一轮 worker 先消耗优化变体，再回到普通 pending 队列。可用 `--optimize-every-alphas 0` 关闭，或用 `--optimize-max-parents` / `--optimize-max-variants` 调整预算。需要阶段性人工复盘时，可手动触发 `optimize-candidates --run-id <run_id> --max-parents 20 --max-variants 100`。
 | `--dry-run` | 不访问真实 BRAIN/LLM，跑本地 mock 闭环 |
 
 常用 preset 由 `settings` 子命令管理：

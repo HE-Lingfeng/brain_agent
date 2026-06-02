@@ -151,12 +151,16 @@ def run_optimization_pass(
         ),
     )
     result = VariantSearchAdapter(repo, run_id, run_dir).run(parent_alpha_list, variant_config, iteration=int(timestamp))
+    variant_candidate_ids = [int(row.get("candidate_id") or 0) for row in result.candidates_delta if row.get("candidate_id")]
+    for candidate_id in variant_candidate_ids:
+        repo.update_candidate_queue_priority(run_id, candidate_id, 100)
     payload["status"] = result.status
     payload["error_summary"] = result.error_summary
     payload["variant_count"] = len(result.candidates_delta)
     payload["parent_alpha_list"] = str(parent_alpha_list)
     payload["tag_source"] = tag_source
-    payload["variant_candidate_ids"] = [row.get("candidate_id") for row in result.candidates_delta]
+    payload["variant_candidate_ids"] = variant_candidate_ids
+    payload["variant_queue_priority"] = 100 if variant_candidate_ids else 0
     return payload
 
 

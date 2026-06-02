@@ -208,7 +208,7 @@ Each batch is capped to `batch_size * concurrency` candidates by default. `--max
 
 `--refill-on-empty` turns the worker into a closer approximation of a daemon queue: when no `sim_pending` or `sim_retryable` candidates remain, it runs a new `GENERATE -> INSPECT -> field_factory` refill and then keeps draining. `--max-empty-refills` defaults to 3 in drain mode; set it to `0` for unlimited refills during a supervised long run.
 
-Drain mode intentionally does not run variant search or enhancement after every batch. It does run a light periodic optimization checkpoint every 500 submitted alphas by default: the worker scans simulated parents, skips parents already tagged by prior optimization passes, and enqueues repair variants only when useful candidates exist. Set `--optimize-every-alphas 0` to disable, or tune `--optimize-max-parents` / `--optimize-max-variants`.
+Drain mode intentionally does not run variant search or enhancement after every batch. It does run a light periodic optimization checkpoint every 500 submitted alphas by default: the worker scans simulated parents, skips parents already tagged by prior optimization passes, and enqueues repair variants only when useful candidates exist. Existing pending candidates stay in the queue; optimization variants receive higher `queue_priority`, so the next worker batch drains them before ordinary pending expressions. Set `--optimize-every-alphas 0` to disable, or tune `--optimize-max-parents` / `--optimize-max-variants`.
 
 When you want to review recent simulation evidence yourself and enqueue targeted repairs on demand, run a manual optimization pass:
 
@@ -219,7 +219,7 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime optimize-cand
   --max-variants 100
 ```
 
-`optimize-candidates` selects simulated parents with repairable evidence, writes durable tags such as `repair_low_fitness`, `repair_subuniverse`, `repair_weight_concentration`, `short_flip_candidate`, and `turnover_control_candidate`, then generates lineage-preserving variants as `sim_pending` candidates for the drain worker. Use `--dry-run` to inspect the selected parents and tags without modifying the queue.
+`optimize-candidates` selects simulated parents with repairable evidence, writes durable tags such as `repair_low_fitness`, `repair_subuniverse`, `repair_weight_concentration`, `short_flip_candidate`, and `turnover_control_candidate`, then generates lineage-preserving variants as higher-priority `sim_pending` candidates for the drain worker. Use `--dry-run` to inspect the selected parents and tags without modifying the queue.
 
 ### Simulation Quota Allocator
 
