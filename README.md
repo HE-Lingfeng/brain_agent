@@ -179,7 +179,7 @@ Defaults are intentionally conservative to reduce BRAIN rate limits:
 | Non-GLB | 8 | 10 | 80 |
 | GLB | 4 | 4 | 16 |
 
-Override with `--concurrency` and `--batch-size`. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish. During long platform waits, the simulator refreshes BRAIN authentication every 15 minutes and keeps polling; this is a defensive health check, not a failed-alpha signal.
+Override with `--concurrency` and `--batch-size`. Real batchSim runs also use a runtime-wide lease file at `.brain_runtime/simulation_leases.json` so multiple worker or retry processes share the same platform budget and never exceed 80 active simulation slots (`8 * 10`). If another process is already using part of the budget, the next batch is automatically trimmed to the remaining slots or waits when all slots are full. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish. During long platform waits, the simulator refreshes BRAIN authentication every 15 minutes and keeps polling; this is a defensive health check, not a failed-alpha signal.
 
 ### Retry Failed Simulations
 
@@ -204,7 +204,14 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
   --refill-on-empty
 ```
 
-Each batch is capped to `batch_size * concurrency` candidates by default. `--max-total-alphas` is enforced against the remaining quota before each batch starts. Use `--mode once` for a single batch.
+Each batch is capped to `batch_size * concurrency` candidates by default, then capped again by the shared runtime simulation lease. `--max-total-alphas` is a local cap for that worker process and is enforced against the worker's own submitted count before each batch starts; it is not a live query of BRAIN's per-account daily usage. Worker submissions are also recorded in `.brain_runtime/daily_simulation_usage.json` so multiple brain_agent workers can be summed by local date. Use `--mode once` for a single batch.
+
+Review the local daily submission ledger with:
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime usage
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime usage --date 2026-06-03
+```
 
 `--refill-on-empty` turns the worker into a closer approximation of a daemon queue: when no `sim_pending` or `sim_retryable` candidates remain, it runs a new `GENERATE -> INSPECT -> field_factory` refill and then keeps draining. `--max-empty-refills` defaults to 3 in drain mode; set it to `0` for unlimited refills during a supervised long run.
 
@@ -331,7 +338,7 @@ Template-library reports with a generic `## Machine Readable (JSON)` block can b
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime gate --run-id <run_id>
 ```
 
-Gate checks read platform-backed checks (`/alphas/{id}/check`, falling back to `/alphas/{id}` `is.checks`), plus dedicated self/prod correlation endpoints. Existing `submit_ready` candidates are rechecked by real gate runs; a complete gate failure revokes stale submit-ready status. Reports only list manual-submission candidates whose latest gate row is complete and passed. Gate failures from transient network/proxy errors are recorded as `gate_status=incomplete` rather than alpha quality failures.
+Gate checks read platform-backed checks (`/alphas/{id}/check`, falling back to `/alphas/{id}` `is.checks`) and normalize page check names such as `CONCENTRATED_WEIGHT`, `LOW_SUB_UNIVERSE_SHARPE`, and `LOW_2Y_SHARPE`. Dedicated self/prod correlation endpoints are intentionally skipped because they can take minutes per alpha; `self_corr_check` and `prod_corr_check` remain `PENDING`. Existing `submit_ready` candidates are rechecked by real gate runs; a complete submission-check failure revokes stale submit-ready status. Reports only list manual-submission candidates whose latest gate row is complete and passed. Gate failures from transient network/proxy errors are recorded as `gate_status=incomplete` rather than alpha quality failures.
 
 Use `--dry-run` for local deterministic mock checks.
 
@@ -404,13 +411,16 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime parse-artifac
 
 - **MATRIX** fields can be used directly in expressions.
 - **VECTOR** fields must be reduced first with `vec_*` (usually `vec_avg(field)`).
+- Dataset-level `--data-type VECTOR` does not guarantee every returned field is a VECTOR field. EVENT fields are incompatible with VECTOR expressions and are rejected by local simulation preflight; use `--data-type MATRIX` for datasets like analyst69 when VECTOR metadata returns EVENT fields.
 - Put `ts_backfill` close to the field for sparse or quarterly data.
 - Prefer `multiply(-1, expr)` for sign flipping.
 - Avoid double-wrapping with `rank`/`zscore`/`group_neutralize` in variant search, as these can cause submission failures.
 
 ## Field Factory
 
-Real inspect runs generate a small auxiliary alpha list from target datafield metadata: MATRIX fields are used directly, VECTOR fields are wrapped with `vec_avg(...)`, and low-coverage fields are backfilled. The result is recorded as `alpha_list_field_factory` and merged into `alpha_list_combined`.
+Real inspect runs generate a small auxiliary alpha list from target datafield metadata: MATRIX fields are used directly, VECTOR fields are wrapped with `vec_avg(...)`, EVENT fields are skipped for VECTOR runs, and low-coverage fields are backfilled. The result is recorded as `alpha_list_field_factory` and merged into `alpha_list_combined`.
+
+Initial generated alpha lists rotate simulation neutralization settings instead of using only one setting. USA/EUR runs start with the configured setting and sweep `INDUSTRY`, `SUBINDUSTRY`, `SECTOR`, and `MARKET`; multi-country regions such as ASI/GLB prefer `MARKET` early. Enhance and variant-search sweeps also try wider setting-level neutralizations including `SLOW_AND_FAST`, `FAST`, `SLOW`, and `NONE` when budget allows.
 
 ## Factor Thesis
 

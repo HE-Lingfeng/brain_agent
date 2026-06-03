@@ -8,7 +8,7 @@ Read this file first when optimizing or debugging this repository. It is the com
 - Do not use `brain-mcp`.
 - Never production-submit alphas unless the user explicitly confirms specific alpha IDs.
 - Before changing code for a new idea, first explain value, applicability, and simpler alternatives. Apply changes only after user approval.
-- Keep `README.md` and `codex_pipeline.md` updated when CLI flags, run behavior, task handling, or artifact formats change.
+- Keep `README.md` and `BRAIN_AGENT_ARCHITECTURE.md` updated when CLI flags, run behavior, task handling, or artifact formats change.
 - The worktree is often dirty. Do not revert unrelated user changes.
 
 ## Fast Start

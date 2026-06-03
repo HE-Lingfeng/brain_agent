@@ -37,6 +37,7 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime tasks --run-i
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime resume --run-id <run_id>
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime report --run-id <run_id>
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker --run-id <run_id> --mode drain --max-total-alphas 5000 --refill-on-empty
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime usage
 ```
 
 Do not use `brain-mcp` in this repository. Route BRAIN platform queries, simulations, reports, retries, and gate checks through `brain_agent` so all activity is recorded under `.brain_runtime`, `brain_agent.sqlite3`, run reports, and candidate tracking.
@@ -68,6 +69,8 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
 
 `--refill-on-empty` makes the worker generate and inspect another candidate batch when no `sim_pending` or `sim_retryable` candidates remain, then continue draining through the existing batch simulator. Keep `--batch-candidates-limit 0` unless there is a reason to cap each worker cycle below `batch_size * concurrency`.
 
+`--max-total-alphas` is a local cap for that worker process, not a live BRAIN platform daily-usage query. Worker submissions are recorded in `.brain_runtime/daily_simulation_usage.json`; use `brain_agent usage` or `brain_agent usage --date YYYY-MM-DD` to inspect the local daily total across `brain_agent` workers. This local total does not include manual BRAIN web submissions or simulations submitted by other tools.
+
 ## Submission Safety
 
 Never call any production submission path unless the user explicitly confirms submission for specific alpha IDs.
@@ -91,4 +94,4 @@ Batch simulation status fetches are intentionally defensive: parent, child, and 
 
 When adding durable functionality, add it to `brain_agent` first. Treat legacy implementations only as reference material unless the user explicitly asks to change them.
 
-Keep `README.md` and `codex_pipeline.md` updated when changing CLI flags, run behavior, task handling, or artifact formats.
+Keep `README.md` and `BRAIN_AGENT_ARCHITECTURE.md` updated when changing CLI flags, run behavior, task handling, or artifact formats.

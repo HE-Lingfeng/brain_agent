@@ -279,4 +279,4 @@ def _is_short_flip_candidate(
 def _is_failed_check(value: str) -> bool:
     if not value:
         return False
-    return value.upper() not in {"PASS", "PASSED", "PENDING", "UNKNOWN", "ERROR", "N/A", "NA"}
+    return value.upper() not in {"PASS", "PASSED", "PENDING", "UNKNOWN", "ERROR", "N/A", "NA", "SKIPPED"}

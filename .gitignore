@@ -5,9 +5,9 @@
 !/.gitignore
 !/README.md
 !/AGENTS.md
+!/BRAIN_AGENT_ARCHITECTURE.md
 !/CLAUDE.md
 !/CODEX_CONTEXT.md
-!/codex_pipeline.md
 !/brain_python_alpha_notes.md
 !/brain_python_alpha_update_plan.md
 
@@ -18,6 +18,7 @@
 !/cli.py
 !/controller.py
 !/credentials.py
+!/daily_usage.py
 !/decision.py
 !/diagnostics.py
 !/forum.py
@@ -34,6 +35,7 @@
 !/runtime.py
 !/scoring.py
 !/selection.py
+!/simulation_leases.py
 !/task_runner.py
 !/thesis.py
 !/optimization.py
@@ -42,6 +44,16 @@
 !/worker.py
 !/tests/
 !/tests/test_brain_agent.py
+
+# Publish project skill docs that steer Claude Code and Codex routing.
+!/.agents/
+!/.agents/skills/
+!/.agents/skills/brain-agent/
+!/.agents/skills/brain-agent/SKILL.md
+!/.claude/
+!/.claude/skills/
+!/.claude/skills/brain-agent/
+!/.claude/skills/brain-agent/SKILL.md
 
 # Local/private material stays out of GitHub.
 .env

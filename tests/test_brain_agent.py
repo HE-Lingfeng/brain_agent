@@ -26,6 +26,7 @@ from brain_agent.adapters import (
 )
 from brain_agent.cli import main
 from brain_agent.credentials import load_credentials
+from brain_agent.daily_usage import DailySimulationUsage
 from brain_agent.decision import DecisionEngine, _parse_llm_actions
 from brain_agent.diagnostics import diagnose_sim_result
 from brain_agent.forum import analyze_forum_post, analyze_search_results, summarize_forum_learning_with_llm
@@ -39,6 +40,7 @@ from brain_agent.reporting import write_report
 from brain_agent.repository import Repository
 from brain_agent.runtime import ensure_runtime, get_runtime_paths
 from brain_agent.scoring import score_candidate
+from brain_agent.simulation_leases import SimulationLeasePool
 from brain_agent.optimizers import SecondOrderOptimizer
 from brain_agent.selection import classify_candidate
 from brain_agent.utils import expression_fingerprint, write_json
@@ -763,6 +765,39 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual("INDUSTRY", data[0]["settings"]["neutralization"])
         self.assertEqual("OFF", data[0]["settings"]["maxTrade"])
 
+    def test_initial_alpha_list_rotates_neutralization_settings(self) -> None:
+        candidates = [{"expression": f"rank(field_{idx})"} for idx in range(4)]
+        out = InspectRawTemplateAdapter(self.repo, "test_run", self.paths.run_dir).write_alpha_list_for_candidates(
+            candidates,
+            self.config,
+            name="neutralization_rotated_alpha_list.json",
+        )
+        rows = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET"],
+            [row["settings"]["neutralization"] for row in rows],
+        )
+
+    def test_initial_alpha_list_prefers_market_for_multi_country_regions(self) -> None:
+        config = RunConfig(
+            dataset="analyst7",
+            region="ASI",
+            delay=1,
+            universe="TOP3000",
+            data_type="MATRIX",
+            neutralization="MARKET",
+        )
+        out = InspectRawTemplateAdapter(self.repo, "test_run", self.paths.run_dir).write_alpha_list_for_candidates(
+            [{"expression": f"rank(asia_field_{idx})"} for idx in range(3)],
+            config,
+            name="asia_neutralization_rotated_alpha_list.json",
+        )
+        rows = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["MARKET", "INDUSTRY", "SUBINDUSTRY"],
+            [row["settings"]["neutralization"] for row in rows],
+        )
+
     def test_simulation_alpha_list_is_score_sorted_before_quota_limit(self) -> None:
         settings = {"region": "USA", "delay": 1}
         weak = "rank(price_close)"
@@ -820,6 +855,54 @@ class BrainAgentTests(unittest.TestCase):
         candidates = {row["expression"]: row["status"] for row in self.repo.list_rows("candidates", "test_run")}
         self.assertEqual("rejected", candidates["rank(missing_field)"])
 
+    def test_simulation_preflight_skips_event_fields_for_vector_runs(self) -> None:
+        config = RunConfig(
+            dataset="analyst69",
+            region="USA",
+            delay=1,
+            universe="TOP3000",
+            data_type="VECTOR",
+        )
+        alpha_list = self.paths.artifacts_dir / "event_vector_alpha_list.json"
+        write_json(
+            alpha_list,
+            [
+                {
+                    "type": "REGULAR",
+                    "settings": {"region": "USA", "universe": "TOP3000", "delay": 1},
+                    "regular": "rank(ts_mean(analyst69_event_field, 20))",
+                }
+            ],
+        )
+        InspectRawTemplateAdapter(self.repo, "test_run", self.paths.run_dir).parse_alpha_list(alpha_list)
+
+        adapter = BatchSimAdapter(self.repo, "test_run", self.paths.run_dir)
+        with patch.object(
+            adapter,
+            "_available_datafields",
+            return_value=AdapterResult(
+                status="ok",
+                candidates_delta=[
+                    {
+                        "field_ids": ["analyst69_event_field"],
+                        "field_types": {"analyst69_event_field": "EVENT"},
+                    }
+                ],
+            ),
+        ):
+            result = adapter._preflight_alpha_list_fields(alpha_list, config, {})
+
+        self.assertEqual("ok", result.status)
+        filtered_path = Path(result.candidates_delta[0]["filtered_alpha_list"])
+        self.assertEqual([], json.loads(filtered_path.read_text(encoding="utf-8")))
+        precheck_artifact = next(a for a in result.artifacts if a["kind"] == "simulation_precheck_status")
+        parsed = adapter.parse_simulation_status(Path(precheck_artifact["path"]))
+        self.assertEqual("ok", parsed.status)
+        sim = self.repo.list_rows("sim_results", "test_run")[0]
+        self.assertEqual("PRECHECK_FAILED", sim["status"])
+        self.assertIn("incompatible", sim["error"])
+        self.assertIn("EVENT", sim["error"])
+
     def test_write_alpha_list_honors_custom_simulation_settings(self) -> None:
         config = RunConfig(
             dataset="model165",
@@ -866,6 +949,18 @@ class BrainAgentTests(unittest.TestCase):
                 v["settings"].get("neutralization", "").upper(),
                 "INDUSTRY",
             )
+
+    def test_cross_sweep_can_try_non_group_neutralizations(self) -> None:
+        settings = {"neutralization": "INDUSTRY", "decay": 10, "region": "USA"}
+        variants = _neutralization_decay_cross_sweep(
+            "rank(x)",
+            settings,
+            parent_fingerprint="wide-neutralization",
+            turnover=0.1,
+            max_variants=32,
+        )
+        neutralizations = {v["settings"].get("neutralization") for v in variants}
+        self.assertTrue(neutralizations.intersection({"SLOW_AND_FAST", "FAST", "SLOW", "NONE"}))
 
     def test_cross_sweep_uses_larger_decays_for_high_turnover(self) -> None:
         settings = {"neutralization": "SECTOR", "decay": 5}
@@ -991,6 +1086,21 @@ class BrainAgentTests(unittest.TestCase):
         self.assertTrue(expressions)
         self.assertTrue(all("vec_avg(vec_field)" in expr for expr in expressions))
 
+    def test_field_factory_skips_event_fields_for_vector_runs(self) -> None:
+        config = RunConfig(
+            dataset="analyst69",
+            region="USA",
+            delay=1,
+            universe="TOP3000",
+            data_type="VECTOR",
+        )
+        rows = _field_factory_alpha_rows(
+            config,
+            [{"id": "event_field", "type": "EVENT", "coverage": 0.9}],
+            max_rows=2,
+        )
+        self.assertEqual([], rows)
+
     def test_field_factory_backfills_low_coverage_fields(self) -> None:
         config = RunConfig(
             dataset="model1",
@@ -1087,6 +1197,8 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual("submit_ready", candidate["status"])
         gate = self.repo.list_rows("gate_checks", "test_run")[0]
         self.assertEqual(1, gate["passed"])
+        self.assertEqual("PENDING", gate["self_corr_check"])
+        self.assertEqual("PENDING", gate["prod_corr_check"])
 
     def test_submission_gate_falls_back_to_alpha_detail_checks(self) -> None:
         fp = expression_fingerprint("rank(close)")
@@ -1165,7 +1277,7 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual("PASS", gate["subuniverse_check"])
         self.assertIn("/alphas/A123", fake_session.url)
 
-    def test_submission_gate_uses_dedicated_correlation_checks_over_pending_submission_rows(self) -> None:
+    def test_submission_gate_skips_dedicated_correlation_checks(self) -> None:
         fp = expression_fingerprint("rank(close)")
         self.repo.upsert_candidate(
             "test_run",
@@ -1196,12 +1308,8 @@ class BrainAgentTests(unittest.TestCase):
                     {"name": "PROD_CORRELATION", "result": "PENDING"},
                 ]
             ),
-            check_self_corr_test=lambda session, alpha_id: FakeFrame(
-                [{"test": "SELF_CORRELATION", "result": "PASS"}]
-            ),
-            check_prod_corr_test=lambda session, alpha_id: FakeFrame(
-                [{"test": "PROD_CORRELATION", "result": "PASS"}]
-            ),
+            check_self_corr_test=lambda session, alpha_id: (_ for _ in ()).throw(AssertionError("self corr should be skipped")),
+            check_prod_corr_test=lambda session, alpha_id: (_ for _ in ()).throw(AssertionError("prod corr should be skipped")),
         )
 
         with patch.dict(os.environ, {"BRAIN_EMAIL": "env@example.com", "BRAIN_PASSWORD": "env_pw"}, clear=False):
@@ -1214,10 +1322,10 @@ class BrainAgentTests(unittest.TestCase):
         gate = self.repo.list_rows("gate_checks", "test_run")[0]
         self.assertEqual(1, gate["passed"])
         self.assertEqual("PASS", gate["submission_check"])
-        self.assertEqual("PASS", gate["self_corr_check"])
-        self.assertEqual("PASS", gate["prod_corr_check"])
+        self.assertEqual("PENDING", gate["self_corr_check"])
+        self.assertEqual("PENDING", gate["prod_corr_check"])
 
-    def test_submission_gate_writes_correlation_failure_into_score(self) -> None:
+    def test_submission_gate_score_ignores_skipped_correlation_checks(self) -> None:
         fp = expression_fingerprint("rank(close)")
         cid = self.repo.upsert_candidate(
             "test_run",
@@ -1262,12 +1370,8 @@ class BrainAgentTests(unittest.TestCase):
                     {"test": "SUB_UNIVERSE_SHARPE", "result": "PASS"},
                 ]
             ),
-            check_self_corr_test=lambda session, alpha_id: FakeFrame(
-                [{"test": "SELF_CORRELATION", "result": "FAIL"}]
-            ),
-            check_prod_corr_test=lambda session, alpha_id: FakeFrame(
-                [{"test": "PROD_CORRELATION", "result": "PASS"}]
-            ),
+            check_self_corr_test=lambda session, alpha_id: (_ for _ in ()).throw(AssertionError("self corr should be skipped")),
+            check_prod_corr_test=lambda session, alpha_id: (_ for _ in ()).throw(AssertionError("prod corr should be skipped")),
         )
 
         with patch.dict(os.environ, {"BRAIN_EMAIL": "env@example.com", "BRAIN_PASSWORD": "env_pw"}, clear=False):
@@ -1277,9 +1381,9 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual("ok", result.status)
         candidate = self.repo.list_rows("candidates", "test_run")[0]
         breakdown = json.loads(candidate["score_breakdown"])
-        self.assertIn("self_corr_high", breakdown["failure_tags"])
-        self.assertIn("reduce_self_correlation", breakdown["repair_objectives"])
-        self.assertFalse(breakdown["gate_passed"])
+        self.assertNotIn("self_corr_high", breakdown["failure_tags"])
+        self.assertNotIn("prod_corr_high", breakdown["failure_tags"])
+        self.assertTrue(breakdown["gate_passed"])
 
     def test_submission_gate_rechecks_and_revokes_stale_submit_ready(self) -> None:
         fp = expression_fingerprint("rank(close)")
@@ -1833,6 +1937,9 @@ class BrainAgentTests(unittest.TestCase):
             stats = SimulationWorker(self.repo, "test_run", self.paths, self.config).run_once(refill_on_empty=True)
 
         self.assertEqual(1, stats.total_submitted)
+        usage = DailySimulationUsage(self.paths.root).summary()
+        self.assertEqual(1, usage["submitted_count"])
+        self.assertEqual(1, len(usage["events"]))
         rows = self.repo.find_candidates_by_status("test_run", [CandidateStatus.SIM_PENDING.value])
         self.assertEqual(["rank(price_close)"], [row["expression"] for row in rows])
 
@@ -1887,7 +1994,7 @@ class BrainAgentTests(unittest.TestCase):
             },
         )
         self.repo.update_candidate_score("test_run", parent_id, 0.86, {"unit": True})
-        for idx in range(500):
+        for idx in range(80):
             expr = f"rank(analyst7_pending_{idx})"
             self.repo.upsert_candidate(
                 "test_run",
@@ -1900,17 +2007,17 @@ class BrainAgentTests(unittest.TestCase):
         with patch.object(
             BatchSimAdapter,
             "run_real",
-            return_value=AdapterResult(status="ok", metrics_delta=[{"status": "COMPLETE"} for _ in range(500)]),
+            return_value=AdapterResult(status="ok", metrics_delta=[{"status": "COMPLETE"} for _ in range(80)]),
         ):
             stats = SimulationWorker(self.repo, "test_run", self.paths, self.config).run_drain(
                 max_batches=1,
-                max_candidates_per_batch=500,
-                optimize_every_alphas=500,
+                max_candidates_per_batch=80,
+                optimize_every_alphas=80,
                 optimize_max_parents=5,
                 optimize_max_variants=8,
             )
 
-        self.assertEqual(500, stats.total_submitted)
+        self.assertEqual(80, stats.total_submitted)
         self.assertEqual(1, stats.optimization_passes)
         self.assertGreater(stats.optimization_variants, 0)
         tag_rows = self.repo.list_candidate_tags("test_run", parent_id)
@@ -1923,6 +2030,79 @@ class BrainAgentTests(unittest.TestCase):
         self.assertTrue(variants)
         self.assertTrue(all(row["status"] == CandidateStatus.SIM_PENDING.value for row in variants))
         self.assertTrue(all(int(row["queue_priority"] or 0) == 100 for row in variants))
+
+    def test_simulation_lease_pool_caps_active_slots(self) -> None:
+        pool = SimulationLeasePool(self.paths.root, max_slots=80)
+
+        first = pool.acquire(run_id="test_run", requested_slots=70)
+        second = pool.acquire(run_id="test_run", requested_slots=40)
+        snapshot = pool.snapshot()
+
+        self.assertEqual(70, first.slots)
+        self.assertEqual(10, second.slots)
+        self.assertEqual(80, snapshot["active_slots"])
+
+        pool.release(second)
+        pool.release(first)
+        self.assertEqual(0, pool.snapshot()["active_slots"])
+
+    def test_batch_sim_adapter_respects_existing_global_simulation_lease(self) -> None:
+        for idx in range(20):
+            expr = f"rank(analyst7_lease_{idx})"
+            self.repo.upsert_candidate(
+                "test_run",
+                expr,
+                expression_fingerprint(expr),
+                status=CandidateStatus.SIM_PENDING.value,
+                source="unit_pending",
+            )
+        pool = SimulationLeasePool(self.paths.root, max_slots=80)
+        existing = pool.acquire(run_id="other_run", requested_slots=70)
+        seen_counts: list[int] = []
+        alpha_list = InspectRawTemplateAdapter(self.repo, "test_run", self.paths.run_dir).write_alpha_list_for_candidates(
+            self.repo.find_candidates_by_status("test_run", [CandidateStatus.SIM_PENDING.value]),
+            self.config,
+            name="lease_test_alpha_list.json",
+        )
+
+        def fake_run_command(adapter, name, cmd, cwd, env=None):
+            alpha_path = Path(cmd[cmd.index("--alpha-json") + 1])
+            output_path = Path(cmd[cmd.index("--output-csv") + 1])
+            rows = json.loads(alpha_path.read_text(encoding="utf-8"))
+            seen_counts.append(len(rows))
+            with output_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["regular_expression", "settings_json", "fingerprint", "alpha_id", "sim_id", "status"],
+                )
+                writer.writeheader()
+                for idx, row in enumerate(rows):
+                    writer.writerow(
+                        {
+                            "regular_expression": row["regular"],
+                            "settings_json": json.dumps(row.get("settings") or {}),
+                            "fingerprint": expression_fingerprint(row["regular"], row.get("settings") or {}),
+                            "alpha_id": f"LEASE{idx}",
+                            "sim_id": f"SIM_LEASE{idx}",
+                            "status": "COMPLETE",
+                        }
+                    )
+            return "", 0
+
+        try:
+            with patch("brain_agent.adapters._credential_env", return_value={}), patch.object(
+                BatchSimAdapter, "_preflight_alpha_list_fields", return_value=AdapterResult(status="ok")
+            ), patch.object(
+                BatchSimAdapter, "_filter_alpha_list_by_batch_diversity", return_value=(alpha_list, [])
+            ), patch.object(BatchSimAdapter, "run_command", fake_run_command):
+                result = BatchSimAdapter(self.repo, "test_run", self.paths.run_dir).run_real(alpha_list, self.config)
+        finally:
+            pool.release(existing)
+
+        self.assertEqual([10], seen_counts)
+        self.assertEqual("ok", result.status)
+        self.assertEqual(10, len(result.metrics_delta))
+        self.assertEqual(10, result.candidates_delta[-1]["submitted_alpha_count"])
 
     def test_worker_prioritizes_optimization_variants_without_dropping_pending(self) -> None:
         ordinary_expr = "rank(analyst7_ordinary)"

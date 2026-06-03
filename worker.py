@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import BatchSimAdapter, InspectRawTemplateAdapter, MakeSomeGemAdapter
+from .daily_usage import DailySimulationUsage
 from .models import CandidateStatus, RunConfig
 from .models import RunStage
 from .optimization import run_optimization_pass
@@ -83,6 +84,7 @@ class SimulationWorker:
         self._config = config
         self._inspect = InspectRawTemplateAdapter(repo, run_id, paths.run_dir)
         self._batch = BatchSimAdapter(repo, run_id, paths.run_dir)
+        self._usage = DailySimulationUsage(paths.root)
         self.stats = WorkerStats()
         self._shutdown_requested = False
         self._batch_counter = 0
@@ -142,14 +144,14 @@ class SimulationWorker:
                     print(f"[worker] max batches ({max_batches}) reached, stopping")
                     break
                 if max_total_alphas is not None and self.stats.total_submitted >= max_total_alphas:
-                    print(f"[worker] daily quota reached ({max_total_alphas} submitted), stopping")
+                    print(f"[worker] worker submission limit reached ({max_total_alphas} submitted), stopping")
                     break
 
                 batch_limit = max_candidates_per_batch
                 if max_total_alphas is not None:
                     remaining = max(0, int(max_total_alphas) - int(self.stats.total_submitted))
                     if remaining <= 0:
-                        print(f"[worker] daily quota reached ({max_total_alphas} submitted), stopping")
+                        print(f"[worker] worker submission limit reached ({max_total_alphas} submitted), stopping")
                         break
                     batch_limit = min(batch_limit, remaining) if batch_limit > 0 else remaining
                 candidates = self._find_pending_candidates(max_retries=max_retries, max_results=batch_limit)
@@ -369,6 +371,7 @@ class SimulationWorker:
         alpha_list = self._inspect.write_alpha_list_for_candidates(candidates, self._config, name=name)
         result = self._batch.run_real(alpha_list, self._config)
         elapsed = time.monotonic() - t0
+        submitted_count = _submitted_alpha_count(result, fallback=count)
 
         succeeded = 0
         failed = 0
@@ -386,7 +389,7 @@ class SimulationWorker:
         return {
             "batch_number": batch_n,
             "candidate_count": count,
-            "submitted_count": count,
+            "submitted_count": submitted_count,
             "succeeded": succeeded,
             "failed": failed,
             "retryable": retryable,
@@ -404,6 +407,17 @@ class SimulationWorker:
         err = batch_info.get("error_summary") or ""
         if err:
             self.stats.errors.append(err)
+        if int(batch_info.get("submitted_count") or 0) > 0:
+            day = self._usage.record_submission(
+                run_id=self._run_id,
+                batch_number=int(batch_info.get("batch_number") or 0),
+                submitted_count=int(batch_info.get("submitted_count") or 0),
+                succeeded=int(batch_info.get("succeeded") or 0),
+                failed=int(batch_info.get("failed") or 0),
+                retryable=int(batch_info.get("retryable") or 0),
+                status=str(batch_info.get("status") or ""),
+            )
+            batch_info["daily_submitted_count"] = int(day.get("submitted_count") or 0)
 
     def _write_stats(self) -> None:
         try:
@@ -425,6 +439,9 @@ class SimulationWorker:
             parts.append(f"{retry} requeued")
         parts.append(f"({elapsed:.0f}s)")
         parts.append(f"total: {self.stats.total_submitted} submitted, {rate:.0f}/hr")
+        daily = batch_info.get("daily_submitted_count")
+        if daily is not None:
+            parts.append(f"today(brain_agent): {int(daily)} submitted")
         print(f"[worker] {' / '.join(parts)}")
 
     def _print_summary(self) -> None:
@@ -466,3 +483,10 @@ class SimulationWorker:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self._shutdown_requested:
             time.sleep(1)
+
+
+def _submitted_alpha_count(result: Any, *, fallback: int) -> int:
+    for item in getattr(result, "candidates_delta", []) or []:
+        if isinstance(item, dict) and "submitted_alpha_count" in item:
+            return max(0, int(item.get("submitted_alpha_count") or 0))
+    return max(0, int(fallback))

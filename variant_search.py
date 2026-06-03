@@ -13,8 +13,8 @@ from .optimizers import SecondOrderOptimizer, build_optimizer_variants
 
 DEFAULT_SIGNAL_SCORE = 0.42
 HARD_FAILURE_TAGS = {"hard_error", "syntax_error", "unknown_variable"}
-NEUTRALIZATION_SWEEP = ("INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET")
-CROSS_SWEEP_NEUTRALIZATION = ["INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET"]
+NEUTRALIZATION_SWEEP = ("INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET", "SLOW_AND_FAST", "FAST", "SLOW", "NONE")
+CROSS_SWEEP_NEUTRALIZATION = ["INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET", "SLOW_AND_FAST", "FAST", "SLOW", "NONE"]
 DECAY_SWEEP = (4, 8, 12, 20)
 WINDOW_SWEEP = (5, 10, 20, 60, 120)
 GROUPS = ("industry", "subindustry", "sector", "market")
@@ -285,7 +285,7 @@ def _rank_zscore_swap(expression: str, settings: dict[str, Any]) -> list[dict[st
 def _group_neutralization_sweep(expression: str, settings: dict[str, Any]) -> list[dict[str, Any]]:
     variants = []
     current_setting = str(settings.get("neutralization") or "").upper()
-    for neutralization in NEUTRALIZATION_SWEEP:
+    for neutralization in _neutralization_sweep_for_settings(settings):
         if neutralization == current_setting:
             continue
         variant_settings = copy.deepcopy(settings)
@@ -325,9 +325,13 @@ def _neutralization_decay_cross_sweep(
     """
     if not parent_fingerprint:
         parent_fingerprint = expression
-    neut_list = sorted(CROSS_SWEEP_NEUTRALIZATION, key=lambda n: _deterministic_hash(parent_fingerprint + "|neut|" + n))
+    neut_list = sorted(
+        _neutralization_sweep_for_settings(settings),
+        key=lambda n: _deterministic_hash(parent_fingerprint + "|neut|" + n),
+    )
     current_neut = str(settings.get("neutralization") or "").upper()
-    neuts = [n for n in neut_list if n != current_neut][:4]
+    max_neutralizations = max(1, min(len(neut_list), max_variants // 2 if max_variants >= 2 else 1))
+    neuts = [n for n in neut_list if n != current_neut][:max_neutralizations]
 
     if turnover is not None and turnover > 0.15:
         decay_pool = [5, 10, 22]
@@ -345,6 +349,18 @@ def _neutralization_decay_cross_sweep(
             vs["decay"] = d
             variants.append(_variant("neut_decay_cross_sweep", expression, vs, {"neutralization": n, "decay": d}))
     return variants[:max_variants]
+
+
+def _neutralization_sweep_for_settings(settings: dict[str, Any]) -> list[str]:
+    region = str(settings.get("region") or "").upper()
+    values = list(CROSS_SWEEP_NEUTRALIZATION)
+    if region in {"ASI", "CHN", "KOR", "TWN", "HKG", "JPN", "GLB"}:
+        preferred = ["MARKET", "INDUSTRY", "SUBINDUSTRY", "SECTOR"]
+        values = preferred + [item for item in values if item not in preferred]
+    current = str(settings.get("neutralization") or "").upper()
+    if current and current not in values:
+        values.insert(0, current)
+    return values
 
 
 def _pnl_prune(

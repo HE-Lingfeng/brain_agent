@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
+NEUTRALIZATION_SETTING_SWEEP = ("INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET", "SLOW_AND_FAST", "FAST", "SLOW", "NONE")
+
+
 @dataclass(frozen=True)
 class OptimizerContext:
     expression: str
@@ -220,7 +223,7 @@ class CorrelationOptimizer(AlphaOptimizer):
             self._variant(f"rank(ts_delta(({expr}), 5))", context, "delta_rank", {"window": 5}),
         ]
         current_neutralization = str(context.settings.get("neutralization") or "").upper()
-        for neutralization in ("SUBINDUSTRY", "SECTOR", "MARKET"):
+        for neutralization in _neutralization_setting_sweep(context.settings):
             if neutralization == current_neutralization:
                 continue
             variants.append(
@@ -371,6 +374,18 @@ def _settings_key(settings: Any) -> str:
     if not isinstance(settings, dict):
         return ""
     return "|".join(f"{key}={settings.get(key)}" for key in sorted(settings))
+
+
+def _neutralization_setting_sweep(settings: dict[str, Any]) -> list[str]:
+    region = str(settings.get("region") or "").upper()
+    values = list(NEUTRALIZATION_SETTING_SWEEP)
+    if region in {"ASI", "CHN", "KOR", "TWN", "HKG", "JPN", "GLB"}:
+        preferred = ["MARKET", "INDUSTRY", "SUBINDUSTRY", "SECTOR"]
+        values = preferred + [item for item in values if item not in preferred]
+    current = str(settings.get("neutralization") or "").upper()
+    if current and current not in values:
+        values.insert(0, current)
+    return values
 
 
 def _float(value: Any, default: float) -> float:

@@ -1,4 +1,4 @@
-# Codex Pipeline Architecture
+# Brain Agent Architecture And Operations
 
 本文档记录当前 `brain_agent` BRAIN Alpha 挖掘系统的有效架构、运行方式、状态契约、已落地能力和仍值得保留的优化路线。过时的 legacy 编排说明和已完成的临时计划已清理。
 
@@ -6,7 +6,7 @@
 
 `brain_agent` 是当前推荐的统一入口。它负责接收用户参数、调用 legacy skill、记录任务与产物、解析候选和回测结果、做失败诊断、选择增强动作、执行 submit gate 检查，并生成可复盘的研究日志。
 
-低 token 维护入口是 `CODEX_CONTEXT.md`。Codex 和 Claude Code 在优化、排障、review 代码前应先读这个短上下文，再按任务范围读取相关模块，避免每次重新扫描完整仓库。
+低 token 维护入口是 `CODEX_CONTEXT.md`。Codex 和 Claude Code 在优化、排障、review 代码前应先读这个短上下文，再按任务范围读取相关模块和本文档，避免每次重新扫描完整仓库。
 
 `.agents/skills/` 仍保留 adapter 所需的真实执行能力，但不作为用户直接调用的主编排层：
 
@@ -271,7 +271,7 @@ SQLite 主要表：
 - `artifacts`：关键输入输出文件索引、hash、stage。
 - `candidates`：expression-level candidate、来源、状态、`selection_score` 和 worker `queue_priority`。
 - `sim_results`：BRAIN simulation 指标、错误、failure tags、diagnosis。
-- `gate_checks`：submission/self/prod correlation 等 submit gate 检查；submission 检查优先读取 `/alphas/{id}/check`，空结果时回退到 `/alphas/{id}` 的 `is.checks`，并归一化 `CONCENTRATED_WEIGHT`、`LOW_SUB_UNIVERSE_SHARPE`、`LOW_2Y_SHARPE` 等平台页面检查名。`/check` 里的 `SELF_CORRELATION` / `PROD_CORRELATION` 可能保持 `PENDING`，submit-ready 判定以 dedicated self/prod correlation endpoints 为准。真实 gate 会重新检查已有 `submit_ready`，完整 gate 失败会撤销旧 ready；报告的人工提交列表只展示 latest gate complete+passed 的候选。
+- `gate_checks`：submission/detail submit gate 检查；submission 检查优先读取 `/alphas/{id}/check`，空结果时回退到 `/alphas/{id}` 的 `is.checks`，并归一化 `CONCENTRATED_WEIGHT`、`LOW_SUB_UNIVERSE_SHARPE`、`LOW_2Y_SHARPE` 等平台页面检查名。Dedicated self/prod correlation endpoints 可能每个 alpha 等数分钟，默认跳过并保留 `self_corr_check=PENDING`、`prod_corr_check=PENDING`；submit-ready 判定以非相关性的 submission/detail checks 为准。真实 gate 会重新检查已有 `submit_ready`，完整 gate 失败会撤销旧 ready；报告的人工提交列表只展示 latest gate complete+passed 的候选。
 - `decisions`：enhance 决策、输入候选和理由。
 - `candidate_tags`：人工或定期优化时写入的 durable tags，例如 `repair_low_fitness`、`repair_subuniverse`、`repair_weight_concentration`、`short_flip_candidate`。
 
@@ -350,7 +350,9 @@ enhance 阶段会把选中候选的 compact 诊断上下文注入 prompt，包�
 
 系统不再只依赖通用 enhance prompt。每轮已有 simulation 结果后，`VariantSearchAdapter` 会对有弱信号或明确可修复目标的原始 alpha 做小规模确定性局部搜索。
 
-真实 inspect 阶段会额外运行保守版 Field Factory：从目标 dataset/region/universe 的 datafield 元数据生成一小批一阶 alpha，MATRIX 字段直接使用，VECTOR 字段自动包 `vec_avg(...)`，低 coverage 字段先做 `ts_backfill`，产物记录为 `alpha_list_field_factory` 并合并进 `alpha_list_combined`。
+真实 inspect 阶段会额外运行保守版 Field Factory：从目标 dataset/region/universe 的 datafield 元数据生成一小批一阶 alpha，MATRIX 字段直接使用，VECTOR 字段自动包 `vec_avg(...)`，VECTOR run 下遇到 EVENT 字段会跳过，低 coverage 字段先做 `ts_backfill`，产物记录为 `alpha_list_field_factory` 并合并进 `alpha_list_combined`。dataset 支持 `--data-type VECTOR` 不等于返回字段实际是 VECTOR 类型；例如 analyst69 若 VECTOR 元数据返回 EVENT 字段，应改用 `--data-type MATRIX` 或等待本地 preflight 将不兼容表达式拦截为 `PRECHECK_FAILED`。
+
+初始 alpha list 不再只使用单一 neutralization setting：`write_alpha_list_for_candidates` 和 Field Factory 会按候选顺序轮换 setting。USA/EUR 默认覆盖 `INDUSTRY`、`SUBINDUSTRY`、`SECTOR`、`MARKET`；ASI/GLB/多国家区域优先把 `MARKET` 放在前面，再试 industry/subindustry。enhance / variant search 的 setting-level sweep 也扩展到 `SLOW_AND_FAST`、`FAST`、`SLOW`、`NONE` 等，不再只在四个 group 类 neutralization 内切换。
 
 当前会先运行专项 Optimizer，再补充通用 close variants。已接入的专项 Optimizer：
 
@@ -528,7 +530,7 @@ make/enhance prompt 只读取 approved lessons，不读取未批准的 forum lea
 | `--use-llm-decide` | DECIDE 阶段使用 LLM 生成 enhancement actions |
 | `--max-enhance-actions` | 每轮最多 enhancement actions |
 
-`worker --mode drain` 可对已有 run 非交互持续消耗 `sim_pending` / `sim_retryable` 队列。`--batch-candidates-limit 0` 表示使用 `batch_size * concurrency` 作为每轮候选上限；如果设置 `--max-total-alphas`，worker 会在每轮提交前按剩余额度进一步收紧本轮上限。`--refill-on-empty` 会在队列耗尽时自动执行一次新的 `GENERATE -> INSPECT -> field_factory` 补料，再继续消耗 simulation 队列；`--max-empty-refills 0` 表示长跑期间不限补料次数。drain 模式不在每批回测后自动进入 enhance，但默认每提交 500 个 alpha 会触发一次轻量优化检查；该检查会跳过已打过优化标签的 parent，若存在可修复候选则写入 `candidate_tags` / `decisions` 并把局部变体作为 `sim_pending` 补入队列。原有待回测表达式不会被清空；优化变体会写入更高 `queue_priority`，下一轮 worker 先消耗优化变体，再回到普通 pending 队列。可用 `--optimize-every-alphas 0` 关闭，或用 `--optimize-max-parents` / `--optimize-max-variants` 调整预算。需要阶段性人工复盘时，可手动触发 `optimize-candidates --run-id <run_id> --max-parents 20 --max-variants 100`。
+`worker --mode drain` 可对已有 run 非交互持续消耗 `sim_pending` / `sim_retryable` 队列。`--batch-candidates-limit 0` 表示使用 `batch_size * concurrency` 作为每轮候选上限；如果设置 `--max-total-alphas`，worker 会在每轮提交前按该 worker 自己的已提交数量收紧本轮上限；它不是实时读取 BRAIN 账号今日用量的口径。真实 batchSim 提交前还会通过 `.brain_runtime/simulation_leases.json` 获取 runtime 级别的共享 simulation 租约，多开 worker 或同时 retry-sim 时所有进程合计最多占用 80 个 active slot（`8 * 10`）；如果已有进程占用部分槽位，本轮 batch 会自动缩到剩余槽位，满 80 时等待释放。worker 每批实际送入模拟器的数量会写入 `.brain_runtime/daily_simulation_usage.json`，可用 `usage --date YYYY-MM-DD` 查看 brain_agent 本地日累计；该口径会汇总多个 worker，但不包含平台网页手动回测或其他工具提交。`--refill-on-empty` 会在队列耗尽时自动执行一次新的 `GENERATE -> INSPECT -> field_factory` 补料，再继续消耗 simulation 队列；`--max-empty-refills 0` 表示长跑期间不限补料次数。drain 模式不在每批回测后自动进入 enhance，但默认每提交 500 个 alpha 会触发一次轻量优化检查；该检查会跳过已打过优化标签的 parent，若存在可修复候选则写入 `candidate_tags` / `decisions` 并把局部变体作为 `sim_pending` 补入队列。原有待回测表达式不会被清空；优化变体会写入更高 `queue_priority`，下一轮 worker 先消耗优化变体，再回到普通 pending 队列。可用 `--optimize-every-alphas 0` 关闭，或用 `--optimize-max-parents` / `--optimize-max-variants` 调整预算。需要阶段性人工复盘时，可手动触发 `optimize-candidates --run-id <run_id> --max-parents 20 --max-variants 100`。
 | `--dry-run` | 不访问真实 BRAIN/LLM，跑本地 mock 闭环 |
 
 常用 preset 由 `settings` 子命令管理：
@@ -809,6 +811,7 @@ Memory 分层口径：
 - `gate_passed`：gate check 通过的候选，进入可学习样本。
 - `gate_incomplete`：submit / self corr / prod corr 等 gate 请求因为网络、代理、限流或运行时错误没有完成；只表示 gate 证据缺失，不作为 alpha 质量失败或 correlation high 证据。
 - `datafields_preflight_incomplete`：simulation 前置 datafields 可用性检查因为平台/API/网络问题没有完成；只表示预检证据缺失，pipeline 会继续进入 batch simulation，让 simulator 返回的逐 alpha 结果成为主要证据。
+- `PRECHECK_FAILED` + incompatible datafield type：simulation 前置检查确认表达式字段类型与目标 data_type 不兼容，例如 VECTOR run 引用 EVENT 字段；这类候选会本地 rejected，不提交平台消耗回测额度。
 - `memory_score` 只使用 simulated / promising / gate_passed 等可学习样本，success rate 使用 recency decay 后的有效样本量，同时保留 raw success rate。
 
 ## 10. 当前维护原则

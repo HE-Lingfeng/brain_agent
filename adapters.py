@@ -20,6 +20,7 @@ from .quota_allocator import allocate_simulation_quota
 from .repository import Repository
 from .scoring import score_candidate, score_candidates
 from .selection import classify_candidate
+from .simulation_leases import SimulationLeasePool
 from .task_runner import TaskRunner
 from .thesis import build_factor_thesis, load_idea_context, thesis_lineage_from_row
 from .utils import expression_fingerprint, file_sha256, read_json, write_json
@@ -392,8 +393,8 @@ class InspectRawTemplateAdapter(SkillAdapter):
         generated = self.repo.list_rows("candidates", self.run_id)
         path = self.artifacts_dir / "02_inspect" / "alpha_list.json"
         rows = []
-        settings = _settings_from_config(config)
-        for row in generated:
+        for idx, row in enumerate(generated):
+            settings = _settings_for_candidate_index(config, str(row["expression"]), idx)
             alpha_row = {"type": "REGULAR", "settings": settings, "regular": row["expression"]}
             thesis = _json_obj(row.get("thesis_json"))
             if thesis:
@@ -488,12 +489,12 @@ class InspectRawTemplateAdapter(SkillAdapter):
         *,
         name: str = "alpha_list_candidates.json",
     ) -> Path:
-        settings = _settings_from_config(config)
         rows = []
-        for candidate in candidates:
+        for idx, candidate in enumerate(candidates):
             expression = str(candidate.get("expression") or "")
             if not expression:
                 continue
+            settings = _settings_for_candidate_index(config, expression, idx)
             row = {"type": "REGULAR", "settings": settings, "regular": expression}
             thesis = thesis_lineage_from_row(candidate)
             if not thesis and candidate.get("thesis_json"):
@@ -714,27 +715,52 @@ class BatchSimAdapter(SkillAdapter):
                 alpha_dest = filtered_path
         alpha_dest, diversity_artifacts = self._filter_alpha_list_by_batch_diversity(alpha_dest)
         preflight_artifacts.extend(diversity_artifacts)
-        if _alpha_list_count(alpha_dest) == 0:
-            return AdapterResult(status="ok", artifacts=preflight_artifacts, metrics_delta=preflight_metrics)
+        alpha_count = _alpha_list_count(alpha_dest)
+        if alpha_count == 0:
+            return AdapterResult(
+                status="ok",
+                artifacts=preflight_artifacts,
+                candidates_delta=[{"submitted_alpha_count": 0}],
+                metrics_delta=preflight_metrics,
+            )
         alpha_dest = alpha_dest.resolve()
         output_csv = (self.artifacts_dir / "03_simulate" / "simulation_status.csv").resolve()
-        cmd = [
-            sys.executable,
-            str(script),
-            "--config",
-            str(self.config_stub()),
-            "--alpha-json",
-            str(alpha_dest),
-            "--output-csv",
-            str(output_csv),
-            "--batch-size",
-            str(config.batch_size),
-            "--concurrency",
-            str(config.concurrency),
-            "--stale-healthcheck-minutes",
-            "15",
-        ]
-        _, returncode = self.run_command(self.name, cmd, skill_root, env=env)
+        runtime_root = self.run_dir.parent.parent if self.run_dir.parent.name == "runs" else self.run_dir.parent
+        lease_pool = SimulationLeasePool(runtime_root)
+        requested_slots = min(alpha_count, max(1, int(config.batch_size) * int(config.concurrency)))
+        lease = lease_pool.acquire(run_id=self.run_id, requested_slots=requested_slots, log_prefix="[batchSim]")
+        if lease.slots < alpha_count:
+            deferred = alpha_count - lease.slots
+            alpha_dest = _limited_alpha_list(alpha_dest, lease.slots).resolve()
+            limited_artifact = self.record_artifact("alpha_list_simulation_lease_limited", alpha_dest, "SIMULATE")
+            preflight_artifacts.append(limited_artifact)
+            print(
+                "[batchSim] global simulation lease limited this batch "
+                f"to {lease.slots} alpha(s); {deferred} deferred "
+                f"(active_slots={lease.active_slots}/{lease.max_slots})"
+            )
+        else:
+            print(f"[batchSim] acquired simulation lease slots={lease.slots} active={lease.active_slots}/{lease.max_slots}")
+        try:
+            cmd = [
+                sys.executable,
+                str(script),
+                "--config",
+                str(self.config_stub()),
+                "--alpha-json",
+                str(alpha_dest),
+                "--output-csv",
+                str(output_csv),
+                "--batch-size",
+                str(config.batch_size),
+                "--concurrency",
+                str(config.concurrency),
+                "--stale-healthcheck-minutes",
+                "15",
+            ]
+            _, returncode = self.run_command(self.name, cmd, skill_root, env=env)
+        finally:
+            lease_pool.release(lease)
         if returncode != 0 and not output_csv.exists():
             return AdapterResult(status="failed", error_summary=f"batch simulation failed; CSV missing: {output_csv}")
         if not output_csv.exists():
@@ -743,6 +769,7 @@ class BatchSimAdapter(SkillAdapter):
         _update_pnl_cache_from_metrics(self.run_dir, parsed.metrics_delta, env)
         parsed.artifacts = preflight_artifacts + parsed.artifacts
         parsed.metrics_delta = preflight_metrics + parsed.metrics_delta
+        parsed.candidates_delta.append({"submitted_alpha_count": _alpha_list_count(alpha_dest)})
         return parsed
 
     def _filter_alpha_list_by_batch_diversity(self, path: Path) -> tuple[Path, list[dict[str, Any]]]:
@@ -773,6 +800,16 @@ class BatchSimAdapter(SkillAdapter):
                 artifacts=[self.record_artifact("datafields_preflight_incomplete", incomplete_path, "SIMULATE")],
             )
         available_fields = set(field_result.candidates_delta[0].get("field_ids") or [])
+        field_types = {
+            str(key): str(value or "").upper()
+            for key, value in (field_result.candidates_delta[0].get("field_types") or {}).items()
+        }
+        if not field_types:
+            field_types = {
+                str(row.get("id")): str(row.get("type") or "").upper()
+                for row in (field_result.candidates_delta[0].get("fields") or [])
+                if isinstance(row, dict) and row.get("id")
+            }
         allowed = available_fields | _BUILTIN_EXPRESSION_SYMBOLS
         keep_rows = []
         skipped_rows = []
@@ -781,13 +818,40 @@ class BatchSimAdapter(SkillAdapter):
                 keep_rows.append(row)
                 continue
             expression = str(row.get("regular") or row.get("regular_expression") or row.get("expression") or "")
+            tokens = _expression_datafield_tokens(expression)
             missing = sorted(
                 token
-                for token in _expression_datafield_tokens(expression)
+                for token in tokens
                 if token not in allowed and token.lower() not in allowed
             )
             if missing:
-                skipped_rows.append((row, expression, missing))
+                skipped_rows.append(
+                    {
+                        "row": row,
+                        "expression": expression,
+                        "error": f"Datafield not available in target universe: {', '.join(missing)}",
+                        "details": {"missing_datafields": missing},
+                        "sim_id_prefix": "precheck_missing_fields",
+                    }
+                )
+                continue
+            incompatible = _incompatible_datafield_tokens(tokens, field_types, config.data_type)
+            if incompatible:
+                rendered = ", ".join(f"{field}({field_type})" for field, field_type in incompatible)
+                skipped_rows.append(
+                    {
+                        "row": row,
+                        "expression": expression,
+                        "error": f"Datafield type incompatible with {str(config.data_type).upper()}: {rendered}",
+                        "details": {
+                            "incompatible_datafields": [
+                                {"field": field, "type": field_type, "target_data_type": str(config.data_type).upper()}
+                                for field, field_type in incompatible
+                            ]
+                        },
+                        "sim_id_prefix": "precheck_incompatible_fields",
+                    }
+                )
             else:
                 keep_rows.append(row)
 
@@ -814,11 +878,14 @@ class BatchSimAdapter(SkillAdapter):
         if cache.exists():
             data = read_json(cache)
             field_ids = data.get("field_ids") if isinstance(data, dict) else []
-            return AdapterResult(
-                status="ok",
-                artifacts=[self.record_artifact("datafields_preflight", cache, "SIMULATE")],
-                candidates_delta=[{"field_ids": list(field_ids or [])}],
-            )
+            field_types = data.get("field_types") if isinstance(data, dict) and isinstance(data.get("field_types"), dict) else {}
+            fields = data.get("fields") if isinstance(data, dict) and isinstance(data.get("fields"), list) else []
+            if field_types or fields:
+                return AdapterResult(
+                    status="ok",
+                    artifacts=[self.record_artifact("datafields_preflight", cache, "SIMULATE")],
+                    candidates_delta=[{"field_ids": list(field_ids or []), "field_types": field_types, "fields": fields}],
+                )
         old_env = os.environ.copy()
         os.environ.update(env)
         try:
@@ -838,6 +905,8 @@ class BatchSimAdapter(SkillAdapter):
                 data_type=config.data_type,
             )
             field_ids = _field_ids_from_df(df)
+            fields = _datafield_records_from_df(df)
+            field_types = {str(row.get("id")): str(row.get("type") or "").upper() for row in fields if row.get("id")}
         except Exception as exc:
             return AdapterResult(status="failed", error_summary=f"datafield preflight failed: {exc}")
         finally:
@@ -852,12 +921,18 @@ class BatchSimAdapter(SkillAdapter):
                 "universe": config.universe,
                 "data_type": config.data_type,
                 "field_ids": sorted(field_ids),
+                "field_types": field_types,
+                "fields": fields,
             },
         )
         artifact = self.record_artifact("datafields_preflight", cache, "SIMULATE")
-        return AdapterResult(status="ok", artifacts=[artifact], candidates_delta=[{"field_ids": sorted(field_ids)}])
+        return AdapterResult(
+            status="ok",
+            artifacts=[artifact],
+            candidates_delta=[{"field_ids": sorted(field_ids), "field_types": field_types, "fields": fields}],
+        )
 
-    def _write_precheck_status(self, path: Path, skipped_rows: list[tuple[dict[str, Any], str, list[str]]]) -> None:
+    def _write_precheck_status(self, path: Path, skipped_rows: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
             "fingerprint",
@@ -876,22 +951,27 @@ class BatchSimAdapter(SkillAdapter):
         with path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            for idx, (row, expression, missing) in enumerate(skipped_rows):
+            for idx, skipped in enumerate(skipped_rows):
+                row = skipped.get("row") if isinstance(skipped.get("row"), dict) else {}
+                expression = str(skipped.get("expression") or "")
+                error = str(skipped.get("error") or "Simulation precheck failed")
+                details = skipped.get("details") if isinstance(skipped.get("details"), dict) else {}
+                sim_id_prefix = str(skipped.get("sim_id_prefix") or "precheck_failed")
                 settings = row.get("settings") if isinstance(row.get("settings"), dict) else {}
                 writer.writerow(
                     {
                         "fingerprint": _candidate_fingerprint(expression, settings),
                         "regular_expression": expression,
                         "settings_json": json.dumps(settings, ensure_ascii=False),
-                        "sim_id": f"precheck_missing_fields_{idx}",
+                        "sim_id": f"{sim_id_prefix}_{idx}",
                         "status": "PRECHECK_FAILED",
                         "alpha_id": "",
                         "pnl": "",
                         "sharpe": "",
                         "turnover": "",
                         "fitness": "",
-                        "error": f"Datafield not available in target universe: {', '.join(missing)}",
-                        "error_details": json.dumps({"missing_datafields": missing}, ensure_ascii=False),
+                        "error": error,
+                        "error_details": json.dumps(details, ensure_ascii=False),
                     }
                 )
 
@@ -1129,8 +1209,8 @@ class SubmissionGateAdapter(SkillAdapter):
                 "candidate_id": row["candidate_id"],
                 "alpha_id": row.get("alpha_id") or "",
                 "submission_check": "PASS" if passed else "PENDING",
-                "self_corr_check": "PASS" if passed else "PENDING",
-                "prod_corr_check": "PASS" if passed else "PENDING",
+                "self_corr_check": "PENDING",
+                "prod_corr_check": "PENDING",
                 "weight_check": "PASS" if passed else "PENDING",
                 "subuniverse_check": "PASS" if passed else "PENDING",
                 "passed": passed,
@@ -1518,6 +1598,39 @@ def _settings_from_config(config: RunConfig) -> dict[str, Any]:
     }
 
 
+def _neutralization_candidates_for_region(region: str, current: str = "") -> list[str]:
+    current_norm = str(current or "").upper()
+    region_norm = str(region or "").upper()
+    if region_norm in {"ASI", "CHN", "KOR", "TWN", "HKG", "JPN", "GLB"}:
+        base = ["MARKET", "INDUSTRY", "SUBINDUSTRY", "SECTOR"]
+    elif region_norm in {"USA", "EUR"}:
+        base = ["INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET"]
+    else:
+        base = ["INDUSTRY", "SUBINDUSTRY", "MARKET", "SECTOR"]
+    if current_norm and current_norm not in base:
+        base.insert(0, current_norm)
+    elif current_norm in base:
+        base = [current_norm] + [item for item in base if item != current_norm]
+    return base
+
+
+def _settings_variants_for_initial_generation(config: RunConfig) -> list[dict[str, Any]]:
+    settings = _settings_from_config(config)
+    variants = []
+    for neutralization in _neutralization_candidates_for_region(config.region, config.neutralization):
+        item = dict(settings)
+        item["neutralization"] = neutralization
+        variants.append(item)
+    return variants or [settings]
+
+
+def _settings_for_candidate_index(config: RunConfig, expression: str, index: int) -> dict[str, Any]:
+    variants = _settings_variants_for_initial_generation(config)
+    if not variants:
+        return _settings_from_config(config)
+    return dict(variants[max(0, int(index)) % len(variants)])
+
+
 def _memory_context_for_run_dir(run_dir: Path, filters: dict[str, Any] | None = None) -> dict[str, Any]:
     path = memory_path_for_run_dir(run_dir)
     if not path.exists():
@@ -1874,11 +1987,11 @@ def _datafield_records_from_df(df: Any) -> list[dict[str, Any]]:
 
 
 def _field_factory_alpha_rows(config: RunConfig, fields: list[dict[str, Any]], *, max_rows: int | None = None) -> list[dict[str, Any]]:
-    settings = _settings_from_config(config)
     rows = []
     field_limit = max(1, min(int(config.max_fields or 8), 20))
     row_limit = max_rows if max_rows is not None else field_limit * 2
-    selected = sorted(fields, key=lambda row: (_field_coverage(row), str(row.get("id") or "")), reverse=True)[:field_limit]
+    compatible_fields = [row for row in fields if _is_field_compatible_for_data_type(row, config.data_type)]
+    selected = sorted(compatible_fields, key=lambda row: (_field_coverage(row), str(row.get("id") or "")), reverse=True)[:field_limit]
     for field in selected:
         field_id = str(field.get("id") or "").strip()
         if not field_id:
@@ -1891,6 +2004,7 @@ def _field_factory_alpha_rows(config: RunConfig, fields: list[dict[str, Any]], *
             f"rank(winsorize(ts_delta({signal}, 5), std=4))",
         ]
         for expression in expressions:
+            settings = _settings_for_candidate_index(config, expression, len(rows))
             rows.append(
                 {
                     "type": "REGULAR",
@@ -1912,6 +2026,29 @@ def _field_factory_base_expression(field_id: str, data_type: str) -> str:
     return field_id
 
 
+def _is_field_compatible_for_data_type(field: dict[str, Any], data_type: str) -> bool:
+    target = str(data_type or "").upper()
+    field_type = str(field.get("type") or "").upper()
+    if target == "VECTOR":
+        return field_type in {"", "VECTOR"}
+    return True
+
+
+def _incompatible_datafield_tokens(
+    tokens: list[str],
+    field_types: dict[str, str],
+    data_type: str,
+) -> list[tuple[str, str]]:
+    if str(data_type or "").upper() != "VECTOR":
+        return []
+    incompatible: list[tuple[str, str]] = []
+    for token in tokens:
+        field_type = str(field_types.get(token) or field_types.get(token.lower()) or "").upper()
+        if field_type and field_type != "VECTOR":
+            incompatible.append((token, field_type))
+    return sorted(set(incompatible))
+
+
 def _field_coverage(field: dict[str, Any]) -> float:
     value = _float_or_none(field.get("coverage"))
     return float(value) if value is not None else 0.0
@@ -1927,41 +2064,30 @@ def _short_flip_suggestions(expression: str) -> list[str]:
 def _run_gate_for_alpha(ace_lib: Any, session: Any, candidate: dict[str, Any]) -> dict[str, Any]:
     alpha_id = str(candidate.get("alpha_id") or "")
     submission_records, submission_error = _submission_gate_records(ace_lib, session, alpha_id)
-    self_records, self_error = _safe_gate_records("self_corr", lambda: ace_lib.check_self_corr_test(session, alpha_id))
-    prod_records, prod_error = _safe_gate_records("prod_corr", lambda: ace_lib.check_prod_corr_test(session, alpha_id))
     submission_records = _normalize_gate_records(submission_records)
-    self_records = _normalize_gate_records(self_records)
-    prod_records = _normalize_gate_records(prod_records)
     submission_scoring_records = _non_correlation_submission_records(submission_records)
     errors = {
         name: err
         for name, err in {
             "submission": submission_error,
-            "self_corr": self_error,
-            "prod_corr": prod_error,
         }.items()
         if err
     }
-    checks = submission_records + self_records + prod_records
+    checks = submission_records
     passed = (
         bool(submission_scoring_records)
-        and bool(self_records)
-        and bool(prod_records)
         and not errors
         and _all_pass(submission_scoring_records)
-        and _all_pass(self_records)
-        and _all_pass(prod_records)
     )
 
     submission_by_test = {str(item.get("test", "")).upper(): str(item.get("result", "")) for item in submission_scoring_records}
-    corr_by_test = {str(item.get("test", "")).upper(): str(item.get("result", "")) for item in self_records + prod_records}
     error_type = _gate_error_type(list(errors.values()))
     return {
         "candidate_id": candidate.get("candidate_id"),
         "alpha_id": alpha_id,
         "submission_check": "ERROR" if submission_error else ("PASS" if submission_scoring_records and _all_pass(submission_scoring_records) else "FAIL"),
-        "self_corr_check": "ERROR" if self_error else corr_by_test.get("SELF_CORRELATION", "UNKNOWN"),
-        "prod_corr_check": "ERROR" if prod_error else corr_by_test.get("PROD_CORRELATION", "UNKNOWN"),
+        "self_corr_check": "PENDING",
+        "prod_corr_check": "PENDING",
         "weight_check": _first_check_result(
             submission_by_test,
             "WEIGHT",

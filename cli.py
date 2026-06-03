@@ -16,6 +16,7 @@ from .adapters import (
 )
 from .controller import BatchLoopController
 from .credentials import load_credentials
+from .daily_usage import DailySimulationUsage
 from .forum import DEFAULT_DAILY_LEARNING_QUERIES, ForumService, render_markdown
 from .knowledge import approve_forum_lesson
 from .memory import AlphaMemory, render_memory_summary_markdown
@@ -100,7 +101,12 @@ def main(argv: list[str] | None = None) -> int:
     worker_p.add_argument("--idle-sleep-seconds", type=int, default=60, help="Poll interval when queue is empty")
     worker_p.add_argument("--max-runtime-hours", type=float, default=None, help="Auto-shutdown after N hours")
     worker_p.add_argument("--max-batches", type=int, default=None, help="Stop after N batches")
-    worker_p.add_argument("--max-total-alphas", type=int, default=5000, help="Stop after submitting N alphas total (default 5000, the BRAIN daily limit)")
+    worker_p.add_argument(
+        "--max-total-alphas",
+        type=int,
+        default=5000,
+        help="Stop this worker after submitting N alphas total (default 5000; local worker cap, not a live BRAIN daily-usage check)",
+    )
     worker_p.add_argument("--max-retries", type=int, default=3, help="Max retries per candidate before marking SIM_FAILED")
     worker_p.add_argument("--batch-candidates-limit", type=int, default=0, help="Max candidates per batch (0 = batch_size * concurrency)")
     worker_p.add_argument("--batch-size", type=int, default=None, help="Override batch_size from run config")
@@ -110,6 +116,9 @@ def main(argv: list[str] | None = None) -> int:
     worker_p.add_argument("--optimize-every-alphas", type=int, default=500, help="Run a repair-variant optimization pass after every N submitted alphas; 0 disables")
     worker_p.add_argument("--optimize-max-parents", type=int, default=20, help="Maximum parents selected by each periodic optimization pass")
     worker_p.add_argument("--optimize-max-variants", type=int, default=100, help="Maximum variants enqueued by each periodic optimization pass")
+
+    usage_p = sub.add_parser("usage")
+    usage_p.add_argument("--date", default=None, help="Local date to summarize, YYYY-MM-DD (default: today)")
 
     report_p = sub.add_parser("report")
     report_p.add_argument("--run-id", required=True)
@@ -244,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_optimize_candidates(args)
     if args.command == "worker":
         return cmd_worker(args)
+    if args.command == "usage":
+        return cmd_usage(args)
     if args.command == "report":
         return cmd_report(args)
     if args.command == "export":
@@ -602,6 +613,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
         return 0 if stats.total_succeeded > 0 else 1
     finally:
         repo.close()
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    root = Path(args.runtime_root or ".brain_runtime").expanduser().resolve()
+    payload = DailySimulationUsage(root).summary(args.date)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
