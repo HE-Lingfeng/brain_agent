@@ -11,8 +11,6 @@
 !/.aiworker_guide_body.md
 !/brain_python_alpha_notes.md
 !/brain_python_alpha_update_plan.md
-!/brain_agent_intro.md
-!/brain_agent_tutorial.md
 
 # Publish only the root package entry files.
 !/__init__.py

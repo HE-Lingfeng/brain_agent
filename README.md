@@ -4,6 +4,41 @@
 
 For Codex/Claude Code maintenance, start with `CODEX_CONTEXT.md` — a compact project map with current invariants, common commands, and the minimal set of files to inspect for common tasks.
 
+## System Overview
+
+`brain_agent` turns alpha research into a recoverable local workflow rather than a loose collection of scripts. Its job is not to replace the researcher; it handles the repetitive, stateful, and failure-prone parts of the loop:
+
+- Generate factor theses and candidate expressions.
+- Build concrete BRAIN simulation settings.
+- Submit bounded batch simulations and track task logs.
+- Diagnose failures and weak results.
+- Generate deterministic variants and diagnosis-aware enhancements.
+- Check submit readiness without production submission.
+- Preserve run evidence in SQLite, artifacts, memory, and reports.
+
+The system has three practical design principles:
+
+- **Unified entry point**: use `python3 -m brain_agent` for runs, resumes, reports, gates, settings, forum learning, memory, and research quality.
+- **Auditable local runtime**: every run writes a run directory, SQLite database, artifacts, task logs, simulation results, gate checks, and reports.
+- **Human-controlled submission**: the pipeline can identify submit-ready candidates, but it never production-submits without explicit alpha-specific confirmation.
+
+At a high level:
+
+```text
+Researcher settings/judgement
+  -> brain_agent CLI
+  -> controller + adapters
+  -> local runtime evidence + BRAIN/LLM calls
+  -> diagnostics, variants, memory, reports
+  -> human review for any submit decision
+```
+
+Each run progresses through:
+
+```text
+GENERATE -> INSPECT -> SIMULATE -> VARIANT_SEARCH -> DECIDE -> ENHANCE -> SUBMIT_GATE -> REPORT
+```
+
 ## Repository Layout
 
 The Python package is organized by responsibility:
@@ -142,8 +177,6 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime run \
   --max-variant-alphas 6 \
   --max-variants-per-alpha 3
 ```
-
-Each run progresses through stages: **GENERATE → INSPECT → SIMULATE → VARIANT_SEARCH → DECIDE → ENHANCE → SUBMIT_GATE → REPORT**.
 
 Use `--dry-run` to validate the local pipeline without calling BRAIN or LLM APIs.
 
