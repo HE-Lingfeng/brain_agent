@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from ..utils import now_iso
+from ..core.utils import now_iso
 
 
 @dataclass(frozen=True)

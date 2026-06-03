@@ -643,8 +643,8 @@ Prompt A/B 不允许跨 dataset/settings 直接比较。只有配置完全一致
 +-------------------------------+--------------------------------------------------+
 ```
 
-根目录仍保留同名兼容 alias，例如 `brain_agent.adapters` 和
-`brain_agent.repository`。维护真实实现时优先改上表中的分组路径。
+根目录只保留入口文件。旧的 `brain_agent.adapters`、`brain_agent.repository`
+等兼容导入已移除；维护和测试都应直接使用上表中的分组路径。
 
 ## 16. 对外介绍时的一句话版本
 

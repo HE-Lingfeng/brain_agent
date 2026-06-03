@@ -18,7 +18,7 @@
 - `legacy/`：旧 standalone platform/forum integration，仅作为参考或显式 legacy debugging 使用。
 - `scripts/`：一次性本地研究/维护脚本。
 
-根目录保留 `adapters.py`、`repository.py`、`worker.py` 等兼容 alias，旧代码和测试仍可通过 `brain_agent.<module>` 导入；新维护应优先改对应分组目录中的真实实现。
+根目录只保留包入口文件，例如 `cli.py`、`__main__.py`。旧的 `adapters.py`、`repository.py`、`worker.py` 等兼容 alias 已移除；代码应直接导入分组目录中的真实实现，例如 `brain_agent.pipeline.adapters`、`brain_agent.core.repository`、`brain_agent.analysis.scoring`。
 
 `.agents/skills/` 仍保留 adapter 所需的真实执行能力，但不作为用户直接调用的主编排层：
 

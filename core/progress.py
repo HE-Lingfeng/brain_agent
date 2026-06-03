@@ -6,9 +6,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ..repository import Repository
-from ..task_runner import TaskRunner
-from ..utils import expression_fingerprint
+from ..core.repository import Repository
+from ..core.task_runner import TaskRunner
+from ..core.utils import expression_fingerprint
 
 
 TERMINAL_STATUSES = {"COMPLETE", "COMPLETED", "ERROR", "FAIL", "FAILED", "TIMEOUT", "SUBMISSION_FAILED", "BATCH_SPAWN_FAILED"}

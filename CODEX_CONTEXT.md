@@ -40,7 +40,7 @@ PYTHONPATH=.. python3 -m unittest tests.test_brain_agent
 - `intelligence/`: `prompting.py`, `forum.py`, `knowledge.py`.
 - `legacy/`: older standalone platform/forum integrations retained for reference or direct debugging.
 - `scripts/`: one-off local research and maintenance scripts.
-- Root-level modules named after moved modules are compatibility aliases. Existing `brain_agent.adapters` or `brain_agent.repository` imports still work, but durable internal changes should edit the grouped implementation file.
+- Root-level compatibility aliases were removed. Import and patch grouped modules directly, for example `brain_agent.pipeline.adapters`, `brain_agent.core.repository`, or `brain_agent.analysis.scoring`.
 
 ## Current Throughput Features
 

@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from typing import Any
 
-from ..memory import extract_field_families, extract_operators
+from ..analysis.memory import extract_field_families, extract_operators
 
 
 DEFAULT_QUOTA_BUCKETS = {"exploit": 0.5, "explore": 0.3, "repair": 0.2}

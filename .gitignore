@@ -14,39 +14,10 @@
 !/brain_agent_intro.md
 !/brain_agent_tutorial.md
 
-# Publish the root-level Python package files.
+# Publish only the root package entry files.
 !/__init__.py
 !/__main__.py
-!/_compat.py
-!/adapters.py
 !/cli.py
-!/controller.py
-!/credentials.py
-!/daily_usage.py
-!/decision.py
-!/diagnostics.py
-!/forum.py
-!/knowledge.py
-!/memory.py
-!/models.py
-!/prompting.py
-!/progress.py
-!/quality.py
-!/quota_allocator.py
-!/optimizers.py
-!/reporting.py
-!/repository.py
-!/runtime.py
-!/scoring.py
-!/selection.py
-!/settings_presets.py
-!/simulation_leases.py
-!/task_runner.py
-!/thesis.py
-!/optimization.py
-!/utils.py
-!/variant_search.py
-!/worker.py
 !/core/
 !/core/__init__.py
 !/core/credentials.py
@@ -137,5 +108,4 @@ documents/
 *.csv
 
 # Source files with credential-loading code are safe to publish.
-!/credentials.py
 !/core/credentials.py

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..diagnostics import is_retryable_sim_failure
-from ..models import CandidateStatus
+from ..analysis.diagnostics import is_retryable_sim_failure
+from ..core.models import CandidateStatus
 
 
 def classify_candidate(

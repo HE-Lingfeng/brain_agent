@@ -5,12 +5,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from ..diagnostics import summarize_failure_tags
-from ..memory import AlphaMemory, memory_path_for_run_dir
-from ..prompting import summarize_run_prompt_metrics
-from ..repository import Repository
-from ..selection import summarize_counts
-from ..utils import write_json
+from ..analysis.diagnostics import summarize_failure_tags
+from ..analysis.memory import AlphaMemory, memory_path_for_run_dir
+from ..intelligence.prompting import summarize_run_prompt_metrics
+from ..core.repository import Repository
+from ..analysis.selection import summarize_counts
+from ..core.utils import write_json
 
 
 def build_run_result(repo: Repository, run_id: str) -> dict[str, Any]:

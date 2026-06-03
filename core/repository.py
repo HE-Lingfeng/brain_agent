@@ -5,8 +5,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..models import RunConfig, RunStage
-from ..utils import now_iso
+from ..core.models import RunConfig, RunStage
+from ..core.utils import now_iso
 
 
 SCHEMA = """

@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ..diagnostics import diagnose_gate_check
-from ..models import CandidateStatus
+from ..analysis.diagnostics import diagnose_gate_check
+from ..core.models import CandidateStatus
 
 
 @dataclass(frozen=True)

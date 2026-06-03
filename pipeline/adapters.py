@@ -10,21 +10,21 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..credentials import load_credentials
-from ..diagnostics import diagnose_sim_result
-from ..memory import AlphaMemory, extract_operators, memory_path_for_run_dir
-from ..models import AdapterResult, CandidateStatus, RunConfig
-from ..prompting import prompt_env
-from ..progress import build_simulation_progress, render_simulation_progress
-from ..quota_allocator import allocate_simulation_quota
-from ..repository import Repository
-from ..scoring import score_candidate, score_candidates
-from ..selection import classify_candidate
-from ..simulation_leases import SimulationLeasePool
-from ..task_runner import TaskRunner
-from ..thesis import build_factor_thesis, load_idea_context, thesis_lineage_from_row
-from ..utils import expression_fingerprint, file_sha256, read_json, write_json
-from ..variant_search import build_variant_search, variant_lineage_from_row
+from ..core.credentials import load_credentials
+from ..analysis.diagnostics import diagnose_sim_result
+from ..analysis.memory import AlphaMemory, extract_operators, memory_path_for_run_dir
+from ..core.models import AdapterResult, CandidateStatus, RunConfig
+from ..intelligence.prompting import prompt_env
+from ..core.progress import build_simulation_progress, render_simulation_progress
+from .quota_allocator import allocate_simulation_quota
+from ..core.repository import Repository
+from ..analysis.scoring import score_candidate, score_candidates
+from ..analysis.selection import classify_candidate
+from ..core.simulation_leases import SimulationLeasePool
+from ..core.task_runner import TaskRunner
+from .thesis import build_factor_thesis, load_idea_context, thesis_lineage_from_row
+from ..core.utils import expression_fingerprint, file_sha256, read_json, write_json
+from .variant_search import build_variant_search, variant_lineage_from_row
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

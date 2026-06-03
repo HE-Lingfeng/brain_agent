@@ -35,10 +35,9 @@ responsibility:
 | `legacy/` | Older standalone platform/forum integrations kept only for reference or explicit legacy debugging |
 | `scripts/` | One-off local research and maintenance scripts |
 
-Root-level modules such as `adapters.py`, `repository.py`, and `worker.py` are
-compatibility aliases for old imports and tests. New durable code changes should
-edit the grouped implementation file, for example `pipeline/adapters.py` or
-`core/repository.py`.
+Root-level compatibility aliases have been removed. Import and patch grouped
+modules directly, for example `brain_agent.pipeline.adapters`,
+`brain_agent.core.repository`, or `brain_agent.analysis.scoring`.
 
 ## Environment Check
 

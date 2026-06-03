@@ -4,10 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..diagnostics import summarize_failure_tags
-from ..repository import Repository
-from ..selection import summarize_counts
-from ..utils import json_dumps
+from ..analysis.diagnostics import summarize_failure_tags
+from ..core.repository import Repository
+from ..analysis.selection import summarize_counts
+from ..core.utils import json_dumps
 
 
 DEFAULT_MAKE_PROMPT_VERSION = "make-v1"

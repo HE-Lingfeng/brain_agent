@@ -8,10 +8,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from ..credentials import load_credentials
-from ..models import CandidateStatus
-from ..prompting import DEFAULT_DECISION_PROMPT_VERSION
-from ..scoring import score_candidates
+from ..core.credentials import load_credentials
+from ..core.models import CandidateStatus
+from ..intelligence.prompting import DEFAULT_DECISION_PROMPT_VERSION
+from ..analysis.scoring import score_candidates
 
 
 @dataclass(frozen=True)

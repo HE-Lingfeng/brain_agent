@@ -7,8 +7,8 @@ import re
 from collections import Counter
 from typing import Any
 
-from ..diagnostics import diagnose_gate_check, diagnose_sim_result
-from ..optimizers import SecondOrderOptimizer, build_optimizer_variants
+from ..analysis.diagnostics import diagnose_gate_check, diagnose_sim_result
+from .optimizers import SecondOrderOptimizer, build_optimizer_variants
 
 
 DEFAULT_SIGNAL_SCORE = 0.42

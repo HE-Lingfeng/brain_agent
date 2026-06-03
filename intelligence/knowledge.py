@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..utils import json_dumps
+from ..core.utils import json_dumps
 
 
 DEFAULT_APPROVED_FORUM_LESSONS_DIR = Path(__file__).resolve().parent / "knowledge" / "approved_forum_lessons"

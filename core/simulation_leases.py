@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..utils import now_iso
+from ..core.utils import now_iso
 
 
 DEFAULT_PLATFORM_SIMULATION_SLOTS = 80

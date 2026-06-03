@@ -7,33 +7,33 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from .adapters import (
+from .pipeline.adapters import (
     BatchSimAdapter,
     InspectRawTemplateAdapter,
     MakeSomeGemAdapter,
     SubmissionGateAdapter,
     copy_artifact_to_run,
 )
-from .controller import BatchLoopController
-from .credentials import load_credentials
-from .daily_usage import DailySimulationUsage
-from .forum import DEFAULT_DAILY_LEARNING_QUERIES, ForumService, render_markdown
-from .knowledge import approve_forum_lesson
-from .memory import AlphaMemory, render_memory_summary_markdown
-from .models import CandidateStatus, RunConfig
-from .optimization import run_optimization_pass
-from .prompting import (
+from .pipeline.controller import BatchLoopController
+from .core.credentials import load_credentials
+from .core.daily_usage import DailySimulationUsage
+from .intelligence.forum import DEFAULT_DAILY_LEARNING_QUERIES, ForumService, render_markdown
+from .intelligence.knowledge import approve_forum_lesson
+from .analysis.memory import AlphaMemory, render_memory_summary_markdown
+from .core.models import CandidateStatus, RunConfig
+from .pipeline.optimization import run_optimization_pass
+from .intelligence.prompting import (
     compare_prompt_runs,
     render_prompt_compare_markdown,
     summarize_run_prompt_metrics,
     write_prompt_compare_report,
 )
-from .progress import build_simulation_progress, render_simulation_progress
-from .quality import build_research_quality_summary, render_research_quality_markdown
-from .reporting import build_run_result, write_report
-from .repository import Repository
-from .runtime import ensure_runtime, get_runtime_paths, new_run_id
-from .settings_presets import (
+from .core.progress import build_simulation_progress, render_simulation_progress
+from .analysis.quality import build_research_quality_summary, render_research_quality_markdown
+from .analysis.reporting import build_run_result, write_report
+from .core.repository import Repository
+from .core.runtime import ensure_runtime, get_runtime_paths, new_run_id
+from .core.settings_presets import (
     SETTING_KEYS,
     find_settings_preset,
     load_settings_presets,
@@ -44,9 +44,9 @@ from .settings_presets import (
     select_settings_preset,
     settings_command_fragment,
 )
-from .task_runner import TaskRunner
-from .utils import write_json
-from .worker import SimulationWorker
+from .core.task_runner import TaskRunner
+from .core.utils import write_json
+from .pipeline.worker import SimulationWorker
 
 
 def _simulation_slot_policy(region: str) -> dict[str, int]:

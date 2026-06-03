@@ -6,8 +6,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from ..diagnostics import summarize_failure_tags
-from ..memory import extract_field_families, extract_operators
+from ..analysis.diagnostics import summarize_failure_tags
+from ..analysis.memory import extract_field_families, extract_operators
 
 
 SUCCESS_SHARPE = 0.8

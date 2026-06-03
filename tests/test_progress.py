@@ -6,11 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from brain_agent.models import RunConfig
-from brain_agent.progress import build_simulation_progress, render_simulation_progress
-from brain_agent.repository import Repository
-from brain_agent.runtime import ensure_runtime, get_runtime_paths
-from brain_agent.utils import expression_fingerprint, write_json
+from brain_agent.core.models import RunConfig
+from brain_agent.core.progress import build_simulation_progress, render_simulation_progress
+from brain_agent.core.repository import Repository
+from brain_agent.core.runtime import ensure_runtime, get_runtime_paths
+from brain_agent.core.utils import expression_fingerprint, write_json
 
 
 class SimulationProgressTests(unittest.TestCase):

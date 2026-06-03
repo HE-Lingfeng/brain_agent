@@ -15,7 +15,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from brain_agent.adapters import (
+from brain_agent.pipeline.adapters import (
     BatchSimAdapter,
     EnhanceTemplateAdapter,
     InspectRawTemplateAdapter,
@@ -25,32 +25,32 @@ from brain_agent.adapters import (
     _limited_alpha_list,
 )
 from brain_agent.cli import main
-from brain_agent.credentials import load_credentials
-from brain_agent.daily_usage import DailySimulationUsage
-from brain_agent.decision import DecisionEngine, _parse_llm_actions
-from brain_agent.diagnostics import diagnose_sim_result
-from brain_agent.forum import analyze_forum_post, analyze_search_results, summarize_forum_learning_with_llm
-from brain_agent.knowledge import approve_forum_lesson, load_forum_learning_report, render_approved_lessons_prompt
-from brain_agent.memory import AlphaMemory, build_scoring_context, extract_field_families, extract_operators
-from brain_agent.models import AdapterResult, CandidateStatus, RunConfig
-from brain_agent.optimization import optimization_tags, select_optimization_parents
-from brain_agent.prompting import prompt_env
-from brain_agent.quota_allocator import allocate_simulation_quota
-from brain_agent.reporting import write_report
-from brain_agent.repository import Repository
-from brain_agent.runtime import ensure_runtime, get_runtime_paths
-from brain_agent.scoring import score_candidate
-from brain_agent.simulation_leases import SimulationLeasePool
-from brain_agent.optimizers import SecondOrderOptimizer
-from brain_agent.selection import classify_candidate
-from brain_agent.utils import expression_fingerprint, write_json
-from brain_agent.variant_search import (
+from brain_agent.core.credentials import load_credentials
+from brain_agent.core.daily_usage import DailySimulationUsage
+from brain_agent.pipeline.decision import DecisionEngine, _parse_llm_actions
+from brain_agent.analysis.diagnostics import diagnose_sim_result
+from brain_agent.intelligence.forum import analyze_forum_post, analyze_search_results, summarize_forum_learning_with_llm
+from brain_agent.intelligence.knowledge import approve_forum_lesson, load_forum_learning_report, render_approved_lessons_prompt
+from brain_agent.analysis.memory import AlphaMemory, build_scoring_context, extract_field_families, extract_operators
+from brain_agent.core.models import AdapterResult, CandidateStatus, RunConfig
+from brain_agent.pipeline.optimization import optimization_tags, select_optimization_parents
+from brain_agent.intelligence.prompting import prompt_env
+from brain_agent.pipeline.quota_allocator import allocate_simulation_quota
+from brain_agent.analysis.reporting import write_report
+from brain_agent.core.repository import Repository
+from brain_agent.core.runtime import ensure_runtime, get_runtime_paths
+from brain_agent.analysis.scoring import score_candidate
+from brain_agent.core.simulation_leases import SimulationLeasePool
+from brain_agent.pipeline.optimizers import SecondOrderOptimizer
+from brain_agent.analysis.selection import classify_candidate
+from brain_agent.core.utils import expression_fingerprint, write_json
+from brain_agent.pipeline.variant_search import (
     _eligible_for_second_order,
     _neutralization_decay_cross_sweep,
     _pearson_corr,
     _pnl_prune,
 )
-from brain_agent.worker import SimulationWorker
+from brain_agent.pipeline.worker import SimulationWorker
 
 
 def _load_batch_simulator_module():
@@ -622,7 +622,7 @@ class BrainAgentTests(unittest.TestCase):
         idea = self.paths.artifacts_dir / "idea.json"
         write_json(idea, {"template": "rank({close})", "idea": "price rank"})
         with patch.object(EnhanceTemplateAdapter, "run_command", return_value=("task1", 0)):
-            with patch("brain_agent.adapters._newest_files", return_value=[]):
+            with patch("brain_agent.pipeline.adapters._newest_files", return_value=[]):
                 result = adapter.run_real([idea], self.config, candidates_context=context)
         self.assertEqual("ok", result.status)
         artifact = self.repo.list_artifacts("test_run", kind="enhance_diagnostics_context")[0]
@@ -2090,7 +2090,7 @@ class BrainAgentTests(unittest.TestCase):
             return "", 0
 
         try:
-            with patch("brain_agent.adapters._credential_env", return_value={}), patch.object(
+            with patch("brain_agent.pipeline.adapters._credential_env", return_value={}), patch.object(
                 BatchSimAdapter, "_preflight_alpha_list_fields", return_value=AdapterResult(status="ok")
             ), patch.object(
                 BatchSimAdapter, "_filter_alpha_list_by_batch_diversity", return_value=(alpha_list, [])
@@ -2399,7 +2399,7 @@ class BrainAgentTests(unittest.TestCase):
     def test_daily_learning_prioritizes_unread_posts_with_history(self) -> None:
         from datetime import datetime
 
-        from brain_agent.forum import _prioritize_unread_posts
+        from brain_agent.intelligence.forum import _prioritize_unread_posts
 
         history = {"link-a": {"read_at": datetime.now().astimezone().isoformat()}}
         ranked = [
@@ -2412,7 +2412,7 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual(["link-a"], [item["link"] for item in recent])
 
     def test_forum_search_click_link_is_canonicalized(self) -> None:
-        from brain_agent.forum import _canonical_forum_link
+        from brain_agent.intelligence.forum import _canonical_forum_link
 
         target = "https://support.worldquantbrain.com/hc/zh-cn/community/posts/33745533142679--SuperAlpha-SELECTION"
         link = "https://support.worldquantbrain.com/hc/zh-cn/search/click?data=abc" + urllib.parse.quote(

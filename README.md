@@ -18,7 +18,9 @@ The Python package is organized by responsibility:
 | `legacy/` | Older standalone platform/forum integrations kept for reference or direct debugging |
 | `scripts/` | One-off local research and maintenance scripts |
 
-Root-level modules such as `adapters.py`, `repository.py`, and `worker.py` are compatibility wrappers. Existing imports like `from brain_agent.adapters import BatchSimAdapter` still work, but new code should prefer the grouped implementation modules when it is editing internals.
+Root-level compatibility wrappers have been removed. Import implementation code
+from the grouped modules, for example `brain_agent.pipeline.adapters`,
+`brain_agent.core.repository`, or `brain_agent.analysis.scoring`.
 
 If this repository is cloned as `brain_agent`, run it from the parent directory:
 

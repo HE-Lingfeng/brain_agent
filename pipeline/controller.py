@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..adapters import (
+from .adapters import (
     BatchSimAdapter,
     EnhanceTemplateAdapter,
     InspectRawTemplateAdapter,
@@ -11,13 +11,13 @@ from ..adapters import (
     SubmissionGateAdapter,
     VariantSearchAdapter,
 )
-from ..decision import DecisionEngine
-from ..memory import AlphaMemory, memory_path_for_run_dir
-from ..models import CandidateStatus, RunConfig, RunStage
-from ..reporting import write_report
-from ..repository import Repository
-from ..runtime import RuntimePaths
-from ..scoring import score_candidate, score_candidates
+from .decision import DecisionEngine
+from ..analysis.memory import AlphaMemory, memory_path_for_run_dir
+from ..core.models import CandidateStatus, RunConfig, RunStage
+from ..analysis.reporting import write_report
+from ..core.repository import Repository
+from ..core.runtime import RuntimePaths
+from ..analysis.scoring import score_candidate, score_candidates
 
 
 class BatchLoopController:

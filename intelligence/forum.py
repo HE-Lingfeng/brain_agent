@@ -15,7 +15,7 @@ from typing import Any
 
 import requests
 
-from ..credentials import load_credentials
+from ..core.credentials import load_credentials
 
 
 ALPHA_TERMS = {
