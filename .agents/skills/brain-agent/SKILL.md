@@ -44,6 +44,25 @@ Use `brain_agent` for normal user requests such as:
 Use legacy atomic skills only when the user explicitly asks to debug or run a
 single legacy component. Do not use `brain-mcp` in this repository.
 
+## Source Layout
+
+`cli.py` remains the package entry point. The implementation is grouped by
+responsibility:
+
+| Path | Purpose |
+|---|---|
+| `core/` | Runtime paths, SQLite repository, dataclasses/enums, settings presets, task runner, leases, daily usage, shared utilities, credential loading |
+| `pipeline/` | Controller, worker/drain mode, legacy adapters, decision logic, quota allocation, variant search, optimization, thesis helpers |
+| `analysis/` | Diagnostics, scoring, selection, memory, research quality, reports |
+| `intelligence/` | Prompting, forum learning, approved knowledge |
+| `legacy/` | Older standalone platform/forum integrations kept only for reference or explicit legacy debugging |
+| `scripts/` | One-off local research and maintenance scripts |
+
+Root-level modules such as `adapters.py`, `repository.py`, and `worker.py` are
+compatibility aliases for old imports and tests. New durable code changes should
+edit the grouped implementation file, for example `pipeline/adapters.py` or
+`core/repository.py`.
+
 ## Common Commands
 
 ```bash

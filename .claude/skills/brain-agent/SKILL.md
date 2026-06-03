@@ -21,6 +21,25 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime <command> ...
 
 `--runtime-root` defaults to `.brain_runtime`. All runs are tracked there.
 
+## Source Layout
+
+`cli.py` remains the package entry point. The implementation is grouped by
+responsibility:
+
+| Path | Purpose |
+|---|---|
+| `core/` | Runtime paths, SQLite repository, dataclasses/enums, settings presets, task runner, leases, daily usage, shared utilities, credential loading |
+| `pipeline/` | Controller, worker/drain mode, legacy adapters, decision logic, quota allocation, variant search, optimization, thesis helpers |
+| `analysis/` | Diagnostics, scoring, selection, memory, research quality, reports |
+| `intelligence/` | Prompting, forum learning, approved knowledge |
+| `legacy/` | Older standalone platform/forum integrations kept only for reference or explicit legacy debugging |
+| `scripts/` | One-off local research and maintenance scripts |
+
+Root-level modules such as `adapters.py`, `repository.py`, and `worker.py` are
+compatibility aliases for old imports and tests. New durable code changes should
+edit the grouped implementation file, for example `pipeline/adapters.py` or
+`core/repository.py`.
+
 ## Environment Check
 
 ```bash
@@ -57,7 +76,9 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime run \
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime run --preset <name> --dataset <id> --dry-run
 ```
 
-The `run` command orchestrates a loop: generate → enhance → simulate → evaluate → (repeat or stop). Key tuning params:
+The `run` command orchestrates the maintained stages:
+GENERATE → INSPECT → SIMULATE → VARIANT_SEARCH → DECIDE → ENHANCE →
+SUBMIT_GATE → REPORT. Key tuning params:
 
 | Param | Default | Description |
 |-------|---------|-------------|

@@ -6,7 +6,21 @@ For Codex/Claude Code maintenance, start with `CODEX_CONTEXT.md` — a compact p
 
 ## Repository Layout
 
-The Python package files live at the repository root. If this repository is cloned as `brain_agent`, run it from the parent directory:
+The Python package is organized by responsibility:
+
+| Path | Purpose |
+|------|---------|
+| `cli.py` | CLI entry point and subcommand wiring |
+| `core/` | Runtime paths, persistence, models, settings, task runner, leases, shared utilities |
+| `pipeline/` | End-to-end controller, legacy adapters, worker/drain mode, quota allocation, variants, optimization |
+| `analysis/` | Diagnostics, candidate scoring/selection, memory, reporting, research quality |
+| `intelligence/` | Prompting, forum learning, approved knowledge handling |
+| `legacy/` | Older standalone platform/forum integrations kept for reference or direct debugging |
+| `scripts/` | One-off local research and maintenance scripts |
+
+Root-level modules such as `adapters.py`, `repository.py`, and `worker.py` are compatibility wrappers. Existing imports like `from brain_agent.adapters import BatchSimAdapter` still work, but new code should prefer the grouped implementation modules when it is editing internals.
+
+If this repository is cloned as `brain_agent`, run it from the parent directory:
 
 ```bash
 python3 -m brain_agent --help

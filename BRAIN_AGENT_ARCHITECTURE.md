@@ -8,6 +8,18 @@
 
 低 token 维护入口是 `CODEX_CONTEXT.md`。Codex 和 Claude Code 在优化、排障、review 代码前应先读这个短上下文，再按任务范围读取相关模块和本文档，避免每次重新扫描完整仓库。
 
+当前包结构按责任分组：
+
+- `cli.py`：命令行入口和 subcommand wiring。
+- `core/`：runtime、SQLite repository、models、task runner、simulation leases、settings presets、shared utilities。
+- `pipeline/`：controller、worker/drain、legacy skill adapters、quota allocation、variant search、optimization、thesis helpers。
+- `analysis/`：diagnostics、scoring、selection、memory、reporting、research quality。
+- `intelligence/`：LLM prompting、forum learning、approved knowledge。
+- `legacy/`：旧 standalone platform/forum integration，仅作为参考或显式 legacy debugging 使用。
+- `scripts/`：一次性本地研究/维护脚本。
+
+根目录保留 `adapters.py`、`repository.py`、`worker.py` 等兼容 alias，旧代码和测试仍可通过 `brain_agent.<module>` 导入；新维护应优先改对应分组目录中的真实实现。
+
 `.agents/skills/` 仍保留 adapter 所需的真实执行能力，但不作为用户直接调用的主编排层：
 
 - `brain-makeSomeGem`：生成 ideas、templates、FASTEXPR 表达式。

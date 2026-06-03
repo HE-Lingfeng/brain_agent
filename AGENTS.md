@@ -42,6 +42,21 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime usage
 
 Do not use `brain-mcp` in this repository. Route BRAIN platform queries, simulations, reports, retries, and gate checks through `brain_agent` so all activity is recorded under `.brain_runtime`, `brain_agent.sqlite3`, run reports, and candidate tracking.
 
+## Source Layout
+
+`cli.py` remains the package entry point. The implementation is grouped by responsibility:
+
+| Path | Purpose |
+|---|---|
+| `core/` | Runtime paths, SQLite repository, dataclasses/enums, settings presets, task runner, leases, daily usage, shared utilities, credential loading |
+| `pipeline/` | Controller, worker/drain mode, legacy adapters, decision logic, quota allocation, variant search, optimization, thesis helpers |
+| `analysis/` | Diagnostics, scoring, selection, memory, research quality, reports |
+| `intelligence/` | Prompting, forum learning, approved knowledge |
+| `legacy/` | Older standalone platform/forum integrations kept only for reference or explicit legacy debugging |
+| `scripts/` | One-off local research and maintenance scripts |
+
+Root-level modules such as `adapters.py`, `repository.py`, and `worker.py` are compatibility aliases for old imports and tests. New durable code changes should edit the grouped implementation file, for example `pipeline/adapters.py` or `core/repository.py`.
+
 ## Forum Knowledge And Template Policy
 
 Forum learning reports under `.brain_runtime/forum_learning/` are review artifacts only. Do not treat them as active system knowledge until the user approves a specific proposal with:
@@ -68,8 +83,6 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
 ```
 
 `--refill-on-empty` makes the worker generate and inspect another candidate batch when no `sim_pending` or `sim_retryable` candidates remain, then continue draining through the existing batch simulator. Keep `--batch-candidates-limit 0` unless there is a reason to cap each worker cycle below `batch_size * concurrency`.
-
-`--max-total-alphas` is a local cap for that worker process, not a live BRAIN platform daily-usage query. Worker submissions are recorded in `.brain_runtime/daily_simulation_usage.json`; use `brain_agent usage` or `brain_agent usage --date YYYY-MM-DD` to inspect the local daily total across `brain_agent` workers. This local total does not include manual BRAIN web submissions or simulations submitted by other tools.
 
 ## Submission Safety
 

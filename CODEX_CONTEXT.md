@@ -33,17 +33,14 @@ PYTHONPATH=.. python3 -m unittest tests.test_brain_agent
 
 ## Module Map
 
-- `cli.py`: CLI flags and subcommands.
-- `controller.py`: end-to-end run/resume loop and phase orchestration.
-- `worker.py`: non-interactive drain mode that keeps generating/submitting/resuming.
-- `adapters.py`: bridges to legacy skills, BRAIN datafields, simulation artifacts, PnL cache, Field Factory.
-- `variant_search.py`: variant generation, neutralization/decay sweep, PnL prune.
-- `optimizers.py`: optimizer classes including second-order variants.
-- `repository.py`: SQLite persistence and candidate/task/run queries.
-- `models.py`: shared dataclasses/enums.
-- `scoring.py`, `selection.py`, `decision.py`: candidate scoring, selection, and run decisions.
-- `reporting.py`: run reports and summaries.
-- `quota_allocator.py`: simulation quota allocation when max sim alphas is constrained.
+- `cli.py`: CLI flags and subcommands. It remains at package root so `python3 -m brain_agent` stays simple.
+- `core/`: `repository.py`, `models.py`, `runtime.py`, `task_runner.py`, `simulation_leases.py`, `daily_usage.py`, `settings_presets.py`, `progress.py`, `credentials.py`, `utils.py`.
+- `pipeline/`: `controller.py`, `worker.py`, `adapters.py`, `decision.py`, `quota_allocator.py`, `variant_search.py`, `optimization.py`, `optimizers.py`, `thesis.py`.
+- `analysis/`: `diagnostics.py`, `scoring.py`, `selection.py`, `memory.py`, `reporting.py`, `quality.py`.
+- `intelligence/`: `prompting.py`, `forum.py`, `knowledge.py`.
+- `legacy/`: older standalone platform/forum integrations retained for reference or direct debugging.
+- `scripts/`: one-off local research and maintenance scripts.
+- Root-level modules named after moved modules are compatibility aliases. Existing `brain_agent.adapters` or `brain_agent.repository` imports still work, but durable internal changes should edit the grouped implementation file.
 
 ## Current Throughput Features
 
