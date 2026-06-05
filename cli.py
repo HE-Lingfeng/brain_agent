@@ -16,6 +16,7 @@ from .pipeline.adapters import (
 )
 from .pipeline.controller import BatchLoopController
 from .core.credentials import load_credentials
+from .core.cleanup import CleanupOptions, build_cleanup_plan, execute_cleanup_plan, render_cleanup_summary
 from .core.daily_usage import DailySimulationUsage
 from .intelligence.forum import DEFAULT_DAILY_LEARNING_QUERIES, ForumService, render_markdown
 from .intelligence.knowledge import approve_forum_lesson
@@ -141,6 +142,20 @@ def main(argv: list[str] | None = None) -> int:
     doctor_p = sub.add_parser("doctor")
     doctor_p.add_argument("--check-llm", action="store_true")
 
+    cleanup_p = sub.add_parser("cleanup")
+    cleanup_p.add_argument("--cache", action="store_true", help="Remove Python caches such as __pycache__ and .pytest_cache")
+    cleanup_p.add_argument("--legacy-outputs", action="store_true", help="Remove legacy skill outputs under .agents")
+    cleanup_p.add_argument("--smoke", action="store_true", help="Remove smoke/dry/test run directories")
+    cleanup_p.add_argument("--failed", action="store_true", help="Remove runs whose recorded stage is FAILED")
+    cleanup_p.add_argument("--older-than-days", type=int, default=None, help="Remove run directories older than N days")
+    cleanup_p.add_argument("--run-id", action="append", dest="run_ids", default=[], help="Remove a specific run id; repeatable")
+    cleanup_p.add_argument("--keep-recent", type=int, default=0, help="Keep the N most recently updated runs even if matched")
+    cleanup_p.add_argument("--vacuum", action="store_true", help="Run SQLite VACUUM on runtime databases")
+    cleanup_p.add_argument("--force-running", action="store_true", help="Allow deleting runs with running/pending task records")
+    cleanup_p.add_argument("--apply", action="store_true", help="Actually remove matched files; default is dry-run")
+    cleanup_p.add_argument("--format", choices=["summary", "json"], default="summary")
+    cleanup_p.add_argument("--repo-root", default=None, help=argparse.SUPPRESS)
+
     forum_p = sub.add_parser("forum")
     forum_p.add_argument("--secret-path", default=None)
     forum_sub = forum_p.add_subparsers(dest="forum_command", required=True)
@@ -265,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_tasks(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "cleanup":
+        return cmd_cleanup(args)
     if args.command == "forum":
         return cmd_forum(args)
     if args.command == "knowledge":
@@ -620,6 +637,31 @@ def cmd_usage(args: argparse.Namespace) -> int:
     payload = DailySimulationUsage(root).summary(args.date)
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    runtime_root = Path(args.runtime_root or ".brain_runtime").expanduser().resolve()
+    options = CleanupOptions(
+        runtime_root=runtime_root,
+        repo_root=Path(args.repo_root).expanduser().resolve() if args.repo_root else Path.cwd(),
+        dry_run=not bool(args.apply),
+        include_cache=bool(args.cache),
+        include_smoke_runs=bool(args.smoke),
+        include_failed_runs=bool(args.failed),
+        older_than_days=args.older_than_days,
+        run_ids=tuple(args.run_ids or ()),
+        keep_recent=max(0, int(args.keep_recent)),
+        include_legacy_outputs=bool(args.legacy_outputs),
+        vacuum=bool(args.vacuum),
+        force_running=bool(args.force_running),
+    )
+    plan = build_cleanup_plan(options)
+    payload = plan if options.dry_run else execute_cleanup_plan(plan)
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render_cleanup_summary(payload), end="")
+    return 0 if not payload.get("errors") else 1
 
 
 def cmd_report(args: argparse.Namespace) -> int:

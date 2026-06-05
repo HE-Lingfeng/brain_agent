@@ -209,6 +209,28 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime export --run-
 
 `report` writes `run_report.md` and `run_result.json`. `export` writes a full JSON dump of the run result.
 
+### Runtime Cleanup
+
+Long worker runs can make `.brain_runtime` large because each run keeps SQLite state, artifacts, reports, and task logs. `cleanup` is dry-run by default; add `--apply` only after reviewing the summary or JSON plan.
+
+```bash
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime cleanup --cache --smoke
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime cleanup --older-than-days 30 --keep-recent 10
+PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime cleanup --run-id <run_id> --apply
+```
+
+Useful selectors:
+
+- `--cache`: remove Python caches such as `__pycache__` and `.pytest_cache`.
+- `--legacy-outputs`: remove legacy skill outputs under `.agents`.
+- `--smoke`: remove smoke/dry/test run directories.
+- `--failed`: remove runs recorded as `FAILED`.
+- `--older-than-days N`: remove run directories older than `N` days.
+- `--keep-recent N`: keep the latest `N` runs even if matched.
+- `--vacuum`: run SQLite `VACUUM` on runtime databases.
+
+Runs with `running` or `pending` task records are skipped unless `--force-running` is passed. Cleanup never deletes BRAIN platform alphas; it only removes local runtime evidence.
+
 ## Simulation & Quota
 
 ### Simulation Progress

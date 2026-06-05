@@ -327,7 +327,9 @@ def write_report(repo: Repository, run_id: str, run_dir: Path) -> tuple[Path, Pa
                 lines.append(f"  - {hint}")
         lines.append(
             f"- checks: submission={gate.get('submission_check') or ''}, "
-            f"self_corr={gate.get('self_corr_check') or ''}, prod_corr={gate.get('prod_corr_check') or ''}"
+            f"self_corr={gate.get('self_corr_check') or ''}, prod_corr={gate.get('prod_corr_check') or ''}, "
+            f"subuniverse={_gate_check_value(gate, 'subuniverse_check', ('SUB_UNIVERSE_SHARPE', 'SUB_UNIVERSE', 'SUBUNIVERSE', 'LOW_SUB_UNIVERSE_SHARPE'))}, "
+            f"two_year={_gate_check_value(gate, 'two_year_check', ('LOW_2Y_SHARPE', '2Y_SHARPE', 'TWO_YEAR_SHARPE', 'IS_2Y_SHARPE'))}"
         )
         lines.append(f"- lifecycle: generated_at={item.get('created_at')}, last_updated={item.get('updated_at')}")
         if sim:
@@ -419,8 +421,63 @@ def _latest_gate_passed_candidates(
             continue
         if str(gate.get("gate_status") or "complete").lower() != "complete":
             continue
+        if not _gate_hard_checks_pass(gate):
+            continue
         ready.append(candidate)
     return ready
+
+
+def _gate_hard_checks_pass(gate: dict[str, Any]) -> bool:
+    return (
+        _check_passed(_gate_check_value(gate, "submission_check", ()))
+        and _check_passed(_gate_check_value(gate, "weight_check", ("WEIGHT", "WEIGHT_CONCENTRATION", "CONCENTRATED_WEIGHT")))
+        and _check_passed(_gate_check_value(gate, "subuniverse_check", ("SUB_UNIVERSE_SHARPE", "SUB_UNIVERSE", "SUBUNIVERSE", "LOW_SUB_UNIVERSE_SHARPE")))
+        and _check_passed(_gate_check_value(gate, "two_year_check", ("LOW_2Y_SHARPE", "2Y_SHARPE", "TWO_YEAR_SHARPE", "IS_2Y_SHARPE")))
+    )
+
+
+def _check_passed(value: Any) -> bool:
+    return str(value or "").upper() in {"PASS", "PASSED"}
+
+
+def _gate_check_value(gate: dict[str, Any], column: str, aliases: tuple[str, ...]) -> str:
+    value = str(gate.get(column) or "")
+    if value:
+        return value.upper()
+    raw = _json_obj(gate.get("raw_json"))
+    checks = raw.get("checks") if isinstance(raw.get("checks"), list) else []
+    by_test = {}
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        test = str(item.get("test") or item.get("name") or "").upper()
+        result = str(item.get("result") or "").upper()
+        if test and result:
+            by_test[test] = _worst_check_result(by_test.get(test), result)
+    for alias in aliases:
+        result = by_test.get(alias)
+        if result:
+            return result
+    return "UNKNOWN"
+
+
+def _worst_check_result(left: Any, right: Any) -> str:
+    left_s = str(left or "").upper()
+    right_s = str(right or "").upper()
+    return right_s if _check_result_rank(right_s) > _check_result_rank(left_s) else left_s
+
+
+def _check_result_rank(value: Any) -> int:
+    result = str(value or "").upper()
+    if result in {"FAIL", "FAILED"}:
+        return 4
+    if result == "ERROR":
+        return 3
+    if result in {"UNKNOWN", "PENDING", ""}:
+        return 2
+    if result in {"PASS", "PASSED"}:
+        return 1
+    return 2
 
 
 def _research_summary(result: dict[str, Any], ready: list[dict[str, Any]], tag_counts: dict[str, int]) -> list[str]:

@@ -390,7 +390,11 @@ class InspectRawTemplateAdapter(SkillAdapter):
         return AdapterResult(status="ok", artifacts=[artifact], candidates_delta=candidates)
 
     def dry_run(self, config: RunConfig) -> AdapterResult:
-        generated = self.repo.list_rows("candidates", self.run_id)
+        generated = [
+            row
+            for row in self.repo.list_rows("candidates", self.run_id)
+            if row.get("status") == CandidateStatus.GENERATED.value
+        ]
         path = self.artifacts_dir / "02_inspect" / "alpha_list.json"
         rows = []
         for idx, row in enumerate(generated):
@@ -567,9 +571,16 @@ class BatchSimAdapter(SkillAdapter):
                 legacy_fp = row.get("fingerprint") or ""
                 candidate_fp = _candidate_fingerprint(expression, settings)
                 fp = legacy_fp or candidate_fp
-                candidate = self.repo.conn.execute(
-                    "SELECT candidate_id, fingerprint FROM candidates WHERE run_id = ? AND fingerprint = ?", (self.run_id, candidate_fp)
-                ).fetchone()
+                candidate = None
+                if legacy_fp:
+                    candidate = self.repo.conn.execute(
+                        "SELECT candidate_id, fingerprint FROM candidates WHERE run_id = ? AND fingerprint = ?",
+                        (self.run_id, legacy_fp),
+                    ).fetchone()
+                if candidate is None:
+                    candidate = self.repo.conn.execute(
+                        "SELECT candidate_id, fingerprint FROM candidates WHERE run_id = ? AND fingerprint = ?", (self.run_id, candidate_fp)
+                    ).fetchone()
                 if candidate is None:
                     legacy_candidate_fp = expression_fingerprint(expression)
                     candidate = self.repo.conn.execute(
@@ -646,7 +657,11 @@ class BatchSimAdapter(SkillAdapter):
         return AdapterResult(status="ok", artifacts=[artifact], metrics_delta=metrics)
 
     def dry_run(self) -> AdapterResult:
-        rows = self.repo.list_rows("candidates", self.run_id)
+        rows = [
+            row
+            for row in self.repo.list_rows("candidates", self.run_id)
+            if row.get("status") == CandidateStatus.SIM_PENDING.value
+        ]
         path = self.artifacts_dir / "03_simulate" / "simulation_status.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
@@ -664,20 +679,30 @@ class BatchSimAdapter(SkillAdapter):
             "error_details",
         ]
         scores = [(1.34, 1.08, 0.22), (0.92, 0.62, 0.35), (0.22, 0.12, 0.18)]
+        existing_rows: list[dict[str, Any]] = []
+        if path.exists():
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                existing_rows = [
+                    {field: str(row.get(field) or "") for field in fieldnames}
+                    for row in reader
+                ]
         with path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
+            writer.writerows(existing_rows)
             for idx, row in enumerate(rows):
                 sharpe, fitness, turnover = scores[idx % len(scores)]
+                sim_idx = len(existing_rows) + idx
                 writer.writerow(
                     {
                         "fingerprint": row["fingerprint"],
                         "regular_expression": row["expression"],
                         "settings_json": "{}",
-                        "sim_id": f"dry_sim_{idx}",
+                        "sim_id": f"dry_sim_{sim_idx}",
                         "status": "COMPLETE",
-                        "alpha_id": f"DRY{idx:04d}",
-                        "pnl": 100000 * (idx + 1),
+                        "alpha_id": f"DRY{sim_idx:04d}",
+                        "pnl": 100000 * (sim_idx + 1),
                         "sharpe": sharpe,
                         "turnover": turnover,
                         "fitness": fitness,
@@ -1061,6 +1086,10 @@ class EnhanceTemplateAdapter(SkillAdapter):
             artifact_kind="enhanced_expressions",
             source_stage="ENHANCE",
         )
+        for candidate in result.candidates_delta:
+            fingerprint = str(candidate.get("fingerprint") or "")
+            if fingerprint:
+                self.repo.update_candidate_status(self.run_id, fingerprint, CandidateStatus.SIM_PENDING.value)
         if rejected_path:
             result.artifacts.append(self.record_artifact("enhanced_expressions_complexity_rejected", rejected_path, "ENHANCE"))
         return result
@@ -1213,6 +1242,7 @@ class SubmissionGateAdapter(SkillAdapter):
                 "prod_corr_check": "PENDING",
                 "weight_check": "PASS" if passed else "PENDING",
                 "subuniverse_check": "PASS" if passed else "PENDING",
+                "two_year_check": "PASS" if passed else "PENDING",
                 "passed": passed,
             }
             self.repo.add_gate_check(self.run_id, gate)
@@ -2074,32 +2104,45 @@ def _run_gate_for_alpha(ace_lib: Any, session: Any, candidate: dict[str, Any]) -
         if err
     }
     checks = submission_records
-    passed = (
-        bool(submission_scoring_records)
-        and not errors
-        and _all_pass(submission_scoring_records)
-    )
 
     submission_by_test = {str(item.get("test", "")).upper(): str(item.get("result", "")) for item in submission_scoring_records}
+    weight_check = _first_check_result(
+        submission_by_test,
+        "WEIGHT",
+        "WEIGHT_CONCENTRATION",
+        "CONCENTRATED_WEIGHT",
+    )
+    subuniverse_check = _first_check_result(
+        submission_by_test,
+        "SUB_UNIVERSE_SHARPE",
+        "SUB_UNIVERSE",
+        "SUBUNIVERSE",
+        "LOW_SUB_UNIVERSE_SHARPE",
+    )
+    two_year_check = _first_check_result(
+        submission_by_test,
+        "LOW_2Y_SHARPE",
+        "2Y_SHARPE",
+        "TWO_YEAR_SHARPE",
+        "IS_2Y_SHARPE",
+    )
+    submission_scoring_passed = bool(submission_scoring_records) and _all_pass(submission_scoring_records)
+    mandatory_checks_passed = _mandatory_submission_checks_pass(
+        weight_check=weight_check,
+        subuniverse_check=subuniverse_check,
+        two_year_check=two_year_check,
+    )
+    passed = not errors and submission_scoring_passed and mandatory_checks_passed
     error_type = _gate_error_type(list(errors.values()))
     return {
         "candidate_id": candidate.get("candidate_id"),
         "alpha_id": alpha_id,
-        "submission_check": "ERROR" if submission_error else ("PASS" if submission_scoring_records and _all_pass(submission_scoring_records) else "FAIL"),
+        "submission_check": "ERROR" if submission_error else ("PASS" if submission_scoring_passed and mandatory_checks_passed else "FAIL"),
         "self_corr_check": "PENDING",
         "prod_corr_check": "PENDING",
-        "weight_check": _first_check_result(
-            submission_by_test,
-            "WEIGHT",
-            "WEIGHT_CONCENTRATION",
-            "CONCENTRATED_WEIGHT",
-        ),
-        "subuniverse_check": _first_check_result(
-            submission_by_test,
-            "SUB_UNIVERSE_SHARPE",
-            "SUBUNIVERSE",
-            "LOW_SUB_UNIVERSE_SHARPE",
-        ),
+        "weight_check": weight_check,
+        "subuniverse_check": subuniverse_check,
+        "two_year_check": two_year_check,
         "gate_status": "incomplete" if errors else "complete",
         "error_type": error_type,
         "incomplete_checks": sorted(errors),
@@ -2113,19 +2156,24 @@ def _submission_gate_records(ace_lib: Any, session: Any, alpha_id: str) -> tuple
     primary_records, primary_error = _safe_gate_records(
         "submission", lambda: ace_lib.get_check_submission(session, alpha_id)
     )
-    if primary_records:
-        return primary_records, ""
 
     base_url = str(getattr(ace_lib, "brain_api_url", "https://api.worldquantbrain.com")).rstrip("/")
-    detail_records, detail_error = _safe_gate_records(
-        "alpha_detail_checks", lambda: _alpha_detail_submission_checks(session, alpha_id, base_url)
-    )
-    if detail_records:
-        return detail_records, ""
+    detail_records: list[dict[str, Any]] = []
+    detail_error = ""
+    if hasattr(session, "get"):
+        detail_records, detail_error = _safe_gate_records(
+            "alpha_detail_checks", lambda: _alpha_detail_submission_checks(session, alpha_id, base_url)
+        )
+
+    records = _merge_gate_records(primary_records, detail_records)
+    errors = []
     if primary_error:
-        joined = "; ".join(part for part in [f"/check: {primary_error}", f"/alphas: {detail_error}" if detail_error else ""] if part)
-        return [], joined[:500]
-    return [], ""
+        errors.append(f"/check: {primary_error}")
+    if detail_error:
+        errors.append(f"/alphas: {detail_error}")
+    if errors:
+        return records, "; ".join(errors)[:500]
+    return records, ""
 
 
 def _should_revoke_submit_ready(candidate: dict[str, Any], gate: dict[str, Any]) -> bool:
@@ -2174,6 +2222,23 @@ def _normalize_gate_records(records: list[dict[str, Any]]) -> list[dict[str, Any
     return normalized
 
 
+def _merge_gate_records(*record_lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for records in record_lists:
+        for record in _normalize_gate_records(records):
+            test = str(record.get("test") or "").upper()
+            if not test:
+                continue
+            if test not in merged:
+                merged[test] = record
+                order.append(test)
+                continue
+            if _check_result_rank(record.get("result")) > _check_result_rank(merged[test].get("result")):
+                merged[test] = record
+    return [merged[test] for test in order]
+
+
 def _non_correlation_submission_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     correlation_tests = {"SELF_CORRELATION", "PROD_CORRELATION"}
     return [record for record in records if str(record.get("test") or "").upper() not in correlation_tests]
@@ -2204,6 +2269,7 @@ def _gate_error_row(candidate: dict[str, Any], exc: Exception, checks: list[str]
         "prod_corr_check": "ERROR",
         "weight_check": "ERROR",
         "subuniverse_check": "ERROR",
+        "two_year_check": "ERROR",
         "gate_status": "incomplete",
         "error_type": _gate_error_type([error]),
         "incomplete_checks": sorted(set(checks)),
@@ -2258,4 +2324,25 @@ def _df_records(df: Any) -> list[dict[str, Any]]:
 
 
 def _all_pass(records: list[dict[str, Any]]) -> bool:
-    return bool(records) and all(str(item.get("result", "")).upper() == "PASS" for item in records)
+    return bool(records) and all(_check_passed(item.get("result")) for item in records)
+
+
+def _mandatory_submission_checks_pass(*, weight_check: str, subuniverse_check: str, two_year_check: str) -> bool:
+    return _check_passed(weight_check) and _check_passed(subuniverse_check) and _check_passed(two_year_check)
+
+
+def _check_passed(value: Any) -> bool:
+    return str(value or "").upper() in {"PASS", "PASSED"}
+
+
+def _check_result_rank(value: Any) -> int:
+    result = str(value or "").upper()
+    if result in {"FAIL", "FAILED"}:
+        return 4
+    if result in {"ERROR"}:
+        return 3
+    if result in {"UNKNOWN", "PENDING", ""}:
+        return 2
+    if result in {"PASS", "PASSED"}:
+        return 1
+    return 2

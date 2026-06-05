@@ -119,7 +119,19 @@ python3 -m brain_agent \
 .brain_runtime/runs/<run_id>/tasks/<task_id>/stderr.log
 ```
 
-### 2.5 Resume 和 Artifact 导入
+### 2.5 Runtime 清理
+
+长期 worker/drain 回测会持续写入 `.brain_runtime/runs/<run_id>`，其中包括 SQLite、artifact、报告和任务日志。清理统一走 CLI，默认只 dry-run 预览，不会删除文件：
+
+```bash
+python3 -m brain_agent --runtime-root .brain_runtime cleanup --cache --smoke
+python3 -m brain_agent --runtime-root .brain_runtime cleanup --older-than-days 30 --keep-recent 10
+python3 -m brain_agent --runtime-root .brain_runtime cleanup --run-id <run_id> --apply
+```
+
+`cleanup` 支持按 `--run-id`、`--smoke`、`--failed`、`--older-than-days` 选择 run，按 `--cache` 清理 Python cache，按 `--legacy-outputs` 清理 `.agents` 下旧 skill 输出，并可用 `--vacuum` 压缩 SQLite。真实删除必须显式加 `--apply`；有 `running` / `pending` 任务记录的 run 默认跳过，除非传 `--force-running`。清理只影响本地 runtime evidence，不会删除 BRAIN 平台上的 alpha。
+
+### 2.6 Resume 和 Artifact 导入
 
 ```bash
 python3 -m brain_agent \
@@ -283,7 +295,7 @@ SQLite 主要表：
 - `artifacts`：关键输入输出文件索引、hash、stage。
 - `candidates`：expression-level candidate、来源、状态、`selection_score` 和 worker `queue_priority`。
 - `sim_results`：BRAIN simulation 指标、错误、failure tags、diagnosis。
-- `gate_checks`：submission/detail submit gate 检查；submission 检查优先读取 `/alphas/{id}/check`，空结果时回退到 `/alphas/{id}` 的 `is.checks`，并归一化 `CONCENTRATED_WEIGHT`、`LOW_SUB_UNIVERSE_SHARPE`、`LOW_2Y_SHARPE` 等平台页面检查名。Dedicated self/prod correlation endpoints 可能每个 alpha 等数分钟，默认跳过并保留 `self_corr_check=PENDING`、`prod_corr_check=PENDING`；submit-ready 判定以非相关性的 submission/detail checks 为准。真实 gate 会重新检查已有 `submit_ready`，完整 gate 失败会撤销旧 ready；报告的人工提交列表只展示 latest gate complete+passed 的候选。
+- `gate_checks`：submission/detail submit gate 检查；真实 gate 同时读取 `/alphas/{id}/check` 和 `/alphas/{id}` 的 `is.checks` 并合并，平台页面 detail check 的 FAIL 会覆盖 `/check` 中同名 PASS，避免网页已显示失败而本地误判 ready。检查名会归一化 `CONCENTRATED_WEIGHT`、`LOW_SUB_UNIVERSE_SHARPE`、`LOW_2Y_SHARPE` 等平台页面名称，并单独记录 `two_year_check`。Dedicated self/prod correlation endpoints 可能每个 alpha 等数分钟，默认跳过并保留 `self_corr_check=PENDING`、`prod_corr_check=PENDING`；submit-ready 判定以非相关性的 submission/detail checks 为准，且 `weight_check`、`subuniverse_check`、`two_year_check` 必须明确 PASS。真实 gate 会重新检查已有 `submit_ready`，完整 gate 失败会撤销旧 ready；报告的人工提交列表只展示 latest gate complete+passed 且硬检查全 PASS 的候选。
 - `decisions`：enhance 决策、输入候选和理由。
 - `candidate_tags`：人工或定期优化时写入的 durable tags，例如 `repair_low_fitness`、`repair_subuniverse`、`repair_weight_concentration`、`short_flip_candidate`。
 

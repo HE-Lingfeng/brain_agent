@@ -18,6 +18,7 @@
 !/cli.py
 !/core/
 !/core/__init__.py
+!/core/cleanup.py
 !/core/credentials.py
 !/core/daily_usage.py
 !/core/models.py

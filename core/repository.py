@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS gate_checks (
   prod_corr_check TEXT,
   weight_check TEXT,
   subuniverse_check TEXT,
+  two_year_check TEXT DEFAULT '',
   gate_status TEXT DEFAULT 'complete',
   error_type TEXT DEFAULT '',
   incomplete_checks TEXT DEFAULT '',
@@ -152,6 +153,7 @@ class Repository:
         self._ensure_column("gate_checks", "error_type", "TEXT DEFAULT ''")
         self._ensure_column("gate_checks", "incomplete_checks", "TEXT DEFAULT ''")
         self._ensure_column("gate_checks", "error", "TEXT DEFAULT ''")
+        self._ensure_column("gate_checks", "two_year_check", "TEXT DEFAULT ''")
         self._ensure_column("candidate_tags", "source", "TEXT DEFAULT ''")
         self._ensure_column("candidate_tags", "metadata_json", "TEXT DEFAULT '{}'")
         self.conn.commit()
@@ -394,9 +396,9 @@ class Repository:
             """
             INSERT INTO gate_checks(
               run_id, candidate_id, alpha_id, submission_check, self_corr_check, prod_corr_check,
-              weight_check, subuniverse_check, gate_status, error_type, incomplete_checks, error,
+              weight_check, subuniverse_check, two_year_check, gate_status, error_type, incomplete_checks, error,
               passed, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -407,6 +409,7 @@ class Repository:
                 result.get("prod_corr_check", ""),
                 result.get("weight_check", ""),
                 result.get("subuniverse_check", ""),
+                result.get("two_year_check", ""),
                 result.get("gate_status", "complete"),
                 result.get("error_type", ""),
                 ",".join(result.get("incomplete_checks") or []),

@@ -157,6 +157,7 @@ def diagnose_gate_check(result: dict[str, Any]) -> dict[str, Any]:
     self_corr = str(result.get("self_corr_check") or "").upper()
     prod_corr = str(result.get("prod_corr_check") or "").upper()
     subuniverse = str(result.get("subuniverse_check") or "").upper()
+    two_year = str(result.get("two_year_check") or "").upper()
     submission = str(result.get("submission_check") or "").upper()
     error = str(result.get("error") or "")
     gate_status = str(result.get("gate_status") or "").lower()
@@ -181,6 +182,10 @@ def diagnose_gate_check(result: dict[str, Any]) -> dict[str, Any]:
         _add(tags, "subuniverse_issue")
         _add(objectives, "improve_coverage")
         reasons.append("Submit gate subuniverse check did not pass.")
+    if _is_failed_check(two_year):
+        _add(tags, "low_2y_sharpe")
+        _add(objectives, "improve_2y_sharpe")
+        reasons.append("Submit gate 2-year Sharpe check did not pass.")
     if _is_failed_check(submission) and not tags:
         _add(tags, "submission_gate_failed")
         reasons.append("Submit gate failed without a more specific local category.")

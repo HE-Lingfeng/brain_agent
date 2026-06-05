@@ -1176,6 +1176,7 @@ class BrainAgentTests(unittest.TestCase):
                     {"test": "FITNESS", "result": "PASS"},
                     {"test": "WEIGHT", "result": "PASS"},
                     {"test": "SUB_UNIVERSE_SHARPE", "result": "PASS"},
+                    {"test": "LOW_2Y_SHARPE", "result": "PASS"},
                     {"test": "SELF_CORRELATION", "result": "PENDING"},
                     {"test": "PROD_CORRELATION", "result": "PENDING"},
                 ]
@@ -1230,6 +1231,7 @@ class BrainAgentTests(unittest.TestCase):
                             {"name": "FITNESS", "result": "PASS"},
                             {"name": "CONCENTRATED_WEIGHT", "result": "PASS"},
                             {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS"},
+                            {"name": "LOW_2Y_SHARPE", "result": "PASS"},
                             {"name": "IS_LADDER_SHARPE", "result": "PASS"},
                             {"name": "SELF_CORRELATION", "result": "PENDING"},
                             {"name": "PROD_CORRELATION", "result": "PENDING"},
@@ -1304,6 +1306,7 @@ class BrainAgentTests(unittest.TestCase):
                     {"name": "FITNESS", "result": "PASS"},
                     {"name": "CONCENTRATED_WEIGHT", "result": "PASS"},
                     {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS"},
+                    {"name": "LOW_2Y_SHARPE", "result": "PASS"},
                     {"name": "SELF_CORRELATION", "result": "PENDING"},
                     {"name": "PROD_CORRELATION", "result": "PENDING"},
                 ]
@@ -1324,6 +1327,159 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual("PASS", gate["submission_check"])
         self.assertEqual("PENDING", gate["self_corr_check"])
         self.assertEqual("PENDING", gate["prod_corr_check"])
+
+    def test_submission_gate_merges_alpha_detail_failures(self) -> None:
+        fp = expression_fingerprint("rank(close)")
+        self.repo.upsert_candidate(
+            "test_run",
+            "rank(close)",
+            fp,
+            status="manual_review",
+            alpha_id="npW0alxd",
+        )
+
+        class FakeFrame:
+            empty = False
+
+            def __init__(self, records):
+                self.records = records
+
+            def to_dict(self, orient):
+                return self.records
+
+        class FakeResponse:
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "is": {
+                        "checks": [
+                            {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "limit": 0.86, "value": 0.72},
+                            {"name": "LOW_2Y_SHARPE", "result": "FAIL", "limit": 1.58, "value": 1.11},
+                        ]
+                    }
+                }
+
+        class FakeSession:
+            def get(self, url):
+                return FakeResponse()
+
+        fake_session = FakeSession()
+        fake_ace = types.SimpleNamespace(
+            brain_api_url="https://api.worldquantbrain.com",
+            start_session=lambda: fake_session,
+            get_check_submission=lambda session, alpha_id: FakeFrame(
+                [
+                    {"test": "SHARPE", "result": "PASS"},
+                    {"test": "FITNESS", "result": "PASS"},
+                    {"test": "CONCENTRATED_WEIGHT", "result": "PASS"},
+                    {"test": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS"},
+                    {"test": "LOW_2Y_SHARPE", "result": "PASS"},
+                ]
+            ),
+        )
+
+        with patch.dict(os.environ, {"BRAIN_EMAIL": "env@example.com", "BRAIN_PASSWORD": "env_pw"}, clear=False):
+            with patch.dict(sys.modules, {"ace_lib": fake_ace}):
+                result = SubmissionGateAdapter(self.repo, "test_run", self.paths.run_dir).run_real()
+
+        self.assertEqual("ok", result.status)
+        candidate = self.repo.list_rows("candidates", "test_run")[0]
+        self.assertEqual("manual_review", candidate["status"])
+        gate = self.repo.list_rows("gate_checks", "test_run")[0]
+        self.assertEqual(0, gate["passed"])
+        self.assertEqual("FAIL", gate["submission_check"])
+        self.assertEqual("FAIL", gate["subuniverse_check"])
+        self.assertEqual("FAIL", gate["two_year_check"])
+
+    def test_submission_gate_requires_subuniverse_check_to_mark_ready(self) -> None:
+        fp = expression_fingerprint("rank(close)")
+        self.repo.upsert_candidate(
+            "test_run",
+            "rank(close)",
+            fp,
+            status="manual_review",
+            alpha_id="A123",
+        )
+
+        class FakeFrame:
+            empty = False
+
+            def __init__(self, records):
+                self.records = records
+
+            def to_dict(self, orient):
+                return self.records
+
+        fake_ace = types.SimpleNamespace(
+            start_session=lambda: object(),
+            get_check_submission=lambda session, alpha_id: FakeFrame(
+                [
+                    {"test": "SHARPE", "result": "PASS"},
+                    {"test": "FITNESS", "result": "PASS"},
+                    {"test": "WEIGHT", "result": "PASS"},
+                ]
+            ),
+        )
+
+        with patch.dict(os.environ, {"BRAIN_EMAIL": "env@example.com", "BRAIN_PASSWORD": "env_pw"}, clear=False):
+            with patch.dict(sys.modules, {"ace_lib": fake_ace}):
+                result = SubmissionGateAdapter(self.repo, "test_run", self.paths.run_dir).run_real()
+
+        self.assertEqual("ok", result.status)
+        candidate = self.repo.list_rows("candidates", "test_run")[0]
+        self.assertEqual("manual_review", candidate["status"])
+        gate = self.repo.list_rows("gate_checks", "test_run")[0]
+        self.assertEqual(0, gate["passed"])
+        self.assertEqual("FAIL", gate["submission_check"])
+        self.assertEqual("UNKNOWN", gate["subuniverse_check"])
+
+    def test_submission_gate_rejects_subuniverse_fail(self) -> None:
+        fp = expression_fingerprint("rank(close)")
+        self.repo.upsert_candidate(
+            "test_run",
+            "rank(close)",
+            fp,
+            status="manual_review",
+            alpha_id="A123",
+        )
+
+        class FakeFrame:
+            empty = False
+
+            def __init__(self, records):
+                self.records = records
+
+            def to_dict(self, orient):
+                return self.records
+
+        fake_ace = types.SimpleNamespace(
+            start_session=lambda: object(),
+            get_check_submission=lambda session, alpha_id: FakeFrame(
+                [
+                    {"test": "SHARPE", "result": "PASS"},
+                    {"test": "FITNESS", "result": "PASS"},
+                    {"test": "CONCENTRATED_WEIGHT", "result": "PASS"},
+                    {"test": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL"},
+                    {"test": "LOW_2Y_SHARPE", "result": "PASS"},
+                ]
+            ),
+        )
+
+        with patch.dict(os.environ, {"BRAIN_EMAIL": "env@example.com", "BRAIN_PASSWORD": "env_pw"}, clear=False):
+            with patch.dict(sys.modules, {"ace_lib": fake_ace}):
+                result = SubmissionGateAdapter(self.repo, "test_run", self.paths.run_dir).run_real()
+
+        self.assertEqual("ok", result.status)
+        candidate = self.repo.list_rows("candidates", "test_run")[0]
+        self.assertEqual("manual_review", candidate["status"])
+        gate = self.repo.list_rows("gate_checks", "test_run")[0]
+        self.assertEqual(0, gate["passed"])
+        self.assertEqual("FAIL", gate["submission_check"])
+        self.assertEqual("FAIL", gate["subuniverse_check"])
 
     def test_submission_gate_score_ignores_skipped_correlation_checks(self) -> None:
         fp = expression_fingerprint("rank(close)")
@@ -1368,6 +1524,7 @@ class BrainAgentTests(unittest.TestCase):
                     {"test": "FITNESS", "result": "PASS"},
                     {"test": "WEIGHT", "result": "PASS"},
                     {"test": "SUB_UNIVERSE_SHARPE", "result": "PASS"},
+                    {"test": "LOW_2Y_SHARPE", "result": "PASS"},
                 ]
             ),
             check_self_corr_test=lambda session, alpha_id: (_ for _ in ()).throw(AssertionError("self corr should be skipped")),
@@ -1464,6 +1621,37 @@ class BrainAgentTests(unittest.TestCase):
         self.assertIn("## Submit Ready Alpha IDs\n- None", text)
         self.assertIn("## Stale Submit Ready Excluded", text)
         self.assertIn("latest_gate_passed=0", text)
+        self.assertIn("No candidates are ready for manual submission.", text)
+
+    def test_report_excludes_submit_ready_when_subuniverse_not_passed(self) -> None:
+        fp = expression_fingerprint("rank(close)")
+        cid = self.repo.upsert_candidate(
+            "test_run",
+            "rank(close)",
+            fp,
+            status="submit_ready",
+            alpha_id="A123",
+        )
+        self.repo.add_gate_check(
+            "test_run",
+            {
+                "candidate_id": cid,
+                "alpha_id": "A123",
+                "submission_check": "PASS",
+                "self_corr_check": "PENDING",
+                "prod_corr_check": "PENDING",
+                "weight_check": "PASS",
+                "subuniverse_check": "FAIL",
+                "gate_status": "complete",
+                "passed": True,
+            },
+        )
+
+        md_path, _ = write_report(self.repo, "test_run", self.paths.run_dir)
+        text = md_path.read_text(encoding="utf-8")
+
+        self.assertIn("## Submit Ready Alpha IDs\n- None", text)
+        self.assertIn("## Stale Submit Ready Excluded", text)
         self.assertIn("No candidates are ready for manual submission.", text)
 
     def test_credentials_env_overrides_secret(self) -> None:
@@ -1568,9 +1756,86 @@ class BrainAgentTests(unittest.TestCase):
             memory.close()
         self.assertEqual(1, summary["run_count"])
         self.assertEqual(10, summary["candidate_observation_count"])
-        self.assertEqual(6, summary["generated_observation_count"])
-        self.assertEqual(4, summary["learnable_observation_count"])
+        self.assertEqual(3, summary["generated_observation_count"])
+        self.assertEqual(7, summary["learnable_observation_count"])
         self.assertTrue(any(item["key"] == "rank" for item in summary["top_operators"]))
+
+    def test_dry_run_full_stage_flow_has_no_pending_after_single_iteration(self) -> None:
+        with redirect_stdout(io.StringIO()):
+            code = main(
+                [
+                    "--runtime-root",
+                    str(self.root),
+                    "run",
+                    "--run-id",
+                    "stage_flow",
+                    "--dataset",
+                    "analyst7",
+                    "--region",
+                    "USA",
+                    "--delay",
+                    "1",
+                    "--universe",
+                    "TOP3000",
+                    "--data-type",
+                    "Matrix",
+                    "--target-ready",
+                    "99",
+                    "--max-iterations",
+                    "1",
+                    "--max-variant-alphas",
+                    "4",
+                    "--max-variants-per-alpha",
+                    "2",
+                    "--max-enhance-actions",
+                    "2",
+                    "--dry-run",
+                ]
+            )
+        self.assertEqual(0, code)
+
+        run_dir = self.root / "runs" / "stage_flow"
+        repo = Repository(run_dir / "brain_agent.sqlite3")
+        try:
+            run = repo.get_run("stage_flow")
+            candidates = repo.list_rows("candidates", "stage_flow")
+            artifacts = repo.list_rows("artifacts", "stage_flow")
+            decisions = repo.list_rows("decisions", "stage_flow")
+            sim_results = repo.list_rows("sim_results", "stage_flow")
+            gate_checks = repo.list_rows("gate_checks", "stage_flow")
+        finally:
+            repo.close()
+
+        self.assertEqual("DONE", run["stage"])
+        self.assertIn("max_iterations reached", run["stop_reason"])
+        self.assertFalse([c for c in candidates if c["status"] == CandidateStatus.SIM_PENDING.value])
+        self.assertTrue(decisions)
+        self.assertTrue(sim_results)
+        self.assertTrue(gate_checks)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        artifact_stages = {a["source_stage"] for a in artifacts}
+        self.assertTrue(
+            {
+                "final_expressions",
+                "alpha_list",
+                "simulation_status",
+                "alpha_list_variants",
+                "enhanced_expressions",
+                "gate_checks",
+            }.issubset(artifact_kinds)
+        )
+        self.assertTrue(
+            {
+                "GENERATE",
+                "INSPECT",
+                "SIMULATE",
+                "VARIANT_SEARCH",
+                "ENHANCE",
+                "SUBMIT_GATE",
+            }.issubset(artifact_stages)
+        )
+        self.assertTrue((run_dir / "run_report.md").exists())
+        self.assertTrue((run_dir / "run_result.json").exists())
 
     def test_alpha_memory_cli_ingest_and_summary(self) -> None:
         with redirect_stdout(io.StringIO()):
@@ -1686,6 +1951,91 @@ class BrainAgentTests(unittest.TestCase):
             code = main(["--runtime-root", str(self.root), "gate", "--run-id", "test_run", "--dry-run"])
         self.assertEqual(0, code)
         self.assertEqual("submit_ready", self.repo.list_rows("candidates", "test_run")[0]["status"])
+
+    def test_cleanup_cli_dry_run_and_apply_cache_and_smoke(self) -> None:
+        cache_dir = self.root / ".pytest_cache"
+        cache_dir.mkdir()
+        (cache_dir / "README.md").write_text("cache", encoding="utf-8")
+        smoke_paths = get_runtime_paths("dry_smoke_run", self.root)
+        ensure_runtime(smoke_paths)
+        smoke_repo = Repository(smoke_paths.db_path)
+        try:
+            smoke_repo.create_run("dry_smoke_run", self.config)
+        finally:
+            smoke_repo.close()
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = main(
+                [
+                    "--runtime-root",
+                    str(self.root),
+                    "cleanup",
+                    "--repo-root",
+                    str(self.root),
+                    "--cache",
+                    "--smoke",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(0, code)
+        dry_payload = json.loads(out.getvalue())
+        self.assertTrue(dry_payload["dry_run"])
+        self.assertTrue(cache_dir.exists())
+        self.assertTrue(smoke_paths.run_dir.exists())
+        self.assertTrue(any(item["kind"] == "cache" for item in dry_payload["items"]))
+        self.assertTrue(any(item.get("run_id") == "dry_smoke_run" for item in dry_payload["items"]))
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = main(
+                [
+                    "--runtime-root",
+                    str(self.root),
+                    "cleanup",
+                    "--repo-root",
+                    str(self.root),
+                    "--cache",
+                    "--smoke",
+                    "--apply",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(0, code)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["dry_run"])
+        self.assertFalse(cache_dir.exists())
+        self.assertFalse(smoke_paths.run_dir.exists())
+        self.assertTrue(payload["removed"])
+
+    def test_cleanup_cli_skips_running_runs_without_force(self) -> None:
+        running_paths = get_runtime_paths("old_dry_running", self.root)
+        ensure_runtime(running_paths)
+        running_repo = Repository(running_paths.db_path)
+        try:
+            running_repo.create_run("old_dry_running", self.config)
+            running_repo.create_task("old_dry_running", "task1", "batchSim", pid=999999, status="running")
+        finally:
+            running_repo.close()
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = main(
+                [
+                    "--runtime-root",
+                    str(self.root),
+                    "cleanup",
+                    "--repo-root",
+                    str(self.root),
+                    "--smoke",
+                    "--apply",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(0, code)
+        payload = json.loads(out.getvalue())
+        self.assertTrue(running_paths.run_dir.exists())
+        self.assertTrue(any(item["reason"] == "has_running_tasks" for item in payload["skipped"]))
 
     def test_decision_engine_rule_fallback_records_cross_and_single(self) -> None:
         actions = DecisionEngine(max_actions=3).decide(
