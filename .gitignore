@@ -68,6 +68,7 @@
 !/scripts/run_variant_round2.py
 !/scripts/run_variant_search.py
 !/scripts/sync_agent_guides.py
+!/scripts/health_check.py
 !/tests/
 !/tests/test_brain_agent.py
 
@@ -76,6 +77,12 @@
 !/.agents/skills/
 !/.agents/skills/brain-agent/
 !/.agents/skills/brain-agent/SKILL.md
+!/.agents/skills/brain-shared/
+!/.agents/skills/brain-shared/scripts/
+!/.agents/skills/brain-shared/scripts/ace_lib.py
+!/.agents/skills/brain-simAlphasinBatch-and-track/
+!/.agents/skills/brain-simAlphasinBatch-and-track/scripts/
+!/.agents/skills/brain-simAlphasinBatch-and-track/scripts/batch_simulator.py
 !/.claude/
 !/.claude/agents/
 !/.claude/agents/brain-consultant.md

@@ -105,6 +105,39 @@ If a batch simulation appears stuck:
 
 Batch simulation status fetches are intentionally defensive: parent, child, and single-simulation polling should retry transient HTTP, JSON parsing, or empty-response reads before recording a simulation failure. Long waits trigger a 15-minute session health check and authentication refresh before polling continues. Do not treat one failed status fetch, one `[BRAIN wait]`, or one `[BRAIN healthcheck]` as a failed alpha.
 
+## Pre-flight Health Check
+
+Before the **first backtest of the day** (or when the user explicitly asks for a health check), run connectivity tests for both the BRAIN platform API and the configured LLM API:
+
+```bash
+PYTHONPATH=.. python3 scripts/health_check.py
+```
+
+This performs real authentication against the BRAIN platform and a minimal chat request to the LLM. If either endpoint is unreachable, fix the network (e.g. VPN, proxy, credentials) before starting any simulation work.
+
+Use `--brain-only` or `--llm-only` to test one side in isolation when only part of the stack appears broken.
+
+### When to run
+
+| Trigger | Action |
+|---|---|
+| First `worker --mode drain` or `run` of the day | Run `health_check.py` before launching |
+| Manual request ("检查连接" / "health check") | Run `health_check.py` and report results |
+| After VPN reconnect / network change | Run `health_check.py` to confirm both endpoints |
+| Batch simulation keeps failing with auth errors | Run `health_check.py --brain-only` |
+| LLM generation keeps timing out | Run `health_check.py --llm-only` |
+
+### Expected output
+
+```json
+{"ok": true, "checks": [
+  {"name": "brain_connectivity", "ok": true, "detail": "authenticated (status=200, expiry=86400s, latency=0.5s)"},
+  {"name": "llm_connectivity", "ok": true, "detail": "provider=deepseek url=... status=200 latency=0.3s"}
+]}
+```
+
+If `"ok": false`, resolve the failing check before proceeding. A healthy brain check means the platform is reachable with valid credentials. A healthy LLM check means the generation/optimization API is responsive.
+
 ## Maintenance Preference
 
 When adding durable functionality, add it to `brain_agent` first. Treat legacy implementations only as reference material unless the user explicitly asks to change them.
