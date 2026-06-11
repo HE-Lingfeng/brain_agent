@@ -425,9 +425,35 @@ class BatchSimulator:
             logger.warning(f"Could not load state file: {e}")
 
     def _submit_with_retry(self, submit_payload, max_retries: int = 8):
-        """Submit simulation batch with backoff on platform concurrency/rate limits."""
+        """Submit simulation batch with backoff on platform concurrency/rate limits and connection errors."""
+        import urllib3
+
+        _SUBMIT_CONNECTION_ERRORS = (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.SSLError,
+            urllib3.exceptions.ProtocolError,
+            urllib3.exceptions.SSLError,
+        )
+
         for attempt in range(max_retries):
-            resp = ace_lib.start_simulation(self.session, submit_payload)
+            try:
+                resp = ace_lib.start_simulation(self.session, submit_payload)
+            except _SUBMIT_CONNECTION_ERRORS as exc:
+                if attempt < max_retries - 1:
+                    delay = min(2 ** attempt, 60)
+                    logger.warning(
+                        f"Batch submission connection error (attempt {attempt + 1}/{max_retries}): "
+                        f"{type(exc).__name__}: {exc}. Retry in {delay}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(
+                    f"Batch submission connection error after {max_retries} attempts: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise
+
             if resp.status_code in [200, 201, 202]:
                 return resp
 
@@ -1260,6 +1286,24 @@ def main():
         default=15,
         help="Minutes of continuous platform wait before refreshing the BRAIN session; set 0 to disable",
     )
+    parser.add_argument(
+        "--auth-retries",
+        type=int,
+        default=None,
+        help="Authentication transport retry attempts before batchSim startup fails. Default: BRAIN_AUTH_MAX_RETRIES or 8.",
+    )
+    parser.add_argument(
+        "--auth-max-delay",
+        type=float,
+        default=None,
+        help="Maximum seconds between authentication transport retries. Default: BRAIN_AUTH_MAX_DELAY or 60.",
+    )
+    parser.add_argument(
+        "--auth-timeout",
+        type=float,
+        default=None,
+        help="Seconds to wait for each authentication request. Default: BRAIN_AUTH_TIMEOUT_SECONDS or 30.",
+    )
     args = parser.parse_args()
 
     tasks_dir = Path(args.tasks_dir)
@@ -1305,7 +1349,19 @@ def main():
     if not isinstance(alpha_list, list):
         raise ValueError(f"alpha json must be a list, got: {type(alpha_list)}")
 
-    session = ace_lib.start_session()
+    try:
+        session = ace_lib.start_session(
+            max_auth_retries=args.auth_retries,
+            auth_max_delay=args.auth_max_delay,
+            auth_timeout=args.auth_timeout,
+        )
+    except Exception as exc:
+        logger.error(
+            "Unable to authenticate with BRAIN after transport retries: "
+            f"{type(exc).__name__}: {exc}. If this is an SSL EOF or DNS error, "
+            "verify the terminal is routed through the same VPN/TUN/proxy path as the browser."
+        )
+        raise
     simulator = BatchSimulator(session, output_csv=str(output_csv_path))
     simulator.heartbeat_seconds = max(10, int(args.heartbeat_seconds))
     simulator.parent_wait_seconds = max(5, int(args.parent_wait_minutes)) * 60

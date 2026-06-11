@@ -313,6 +313,7 @@ SQLite 主要表：
 - batch simulator 在提交前会剥离 `factor_thesis`、`lineage`、`variant_params` 等内部研究元数据，只把 BRAIN simulation API 接受的顶层字段发送给平台。
 - batch parent 默认最多等待 30 分钟生成 children，child simulation 默认最多等待 60 分钟完成；高峰期 `[BRAIN wait]` 不代表失败。
 - 连续等待超过 15 分钟时，batch simulator 会写出 `[BRAIN healthcheck]` 日志、刷新 BRAIN session 并继续 polling；这是恢复动作，不会直接把 alpha 标为失败。
+- 启动登录会对 DNS、timeout、SSL EOF 等 transport failure 做指数退避重试，并在每次重试前重建 requests session，避免 VPN/TUN/代理链路短抖动让整个 batchSim 立即失败；可用 `BRAIN_AUTH_MAX_RETRIES`、`BRAIN_AUTH_MAX_DELAY`、`BRAIN_AUTH_TIMEOUT_SECONDS` 或 batchSim 的 `--auth-*` 参数调整。
 - batch parent、child 和 single simulation 的状态抓取会对临时 HTTP、JSON 解析、空响应问题做有限重试，避免一次抓取不到就写成回测失败。
 - `TIMEOUT`、`BATCH_SPAWN_FAILED`、限流/队列类 `SUBMISSION_FAILED` 会标为 `sim_retryable`，可用 `retry-sim --run-id <run_id>` 只重跑这些平台型失败。
 

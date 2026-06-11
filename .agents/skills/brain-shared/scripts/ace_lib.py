@@ -47,6 +47,34 @@ class SingleSession(requests.Session):
     def get_relogin_lock(self):
         return self._relogin_lock
 
+    @classmethod
+    def reset_instance(cls):
+        """Drop the singleton session so retry attempts do not reuse a bad pool."""
+        with cls._lock:
+            old_session = cls._instance
+            cls._instance = None
+        if old_session is not None:
+            try:
+                old_session.close()
+            except Exception:
+                pass
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except Exception:
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
+    try:
+        value = float(os.environ.get(name, ""))
+    except Exception:
+        return default
+    return max(minimum, value)
+
 
 def setup_logger() -> logging.Logger:
     """
@@ -135,7 +163,13 @@ def get_credentials() -> tuple[str, str]:
     return (data["email"], data["password"])
 
 
-def start_session() -> SingleSession:
+def start_session(
+    *,
+    max_auth_retries: Optional[int] = None,
+    auth_backoff_base: Optional[float] = None,
+    auth_max_delay: Optional[float] = None,
+    auth_timeout: Optional[float] = None,
+) -> SingleSession:
     """
     Start a new session with the WorldQuant BRAIN platform.
 
@@ -149,9 +183,57 @@ def start_session() -> SingleSession:
         requests.exceptions.RequestException: If there's an error during the authentication process.
     """
 
-    s = SingleSession()
-    s.auth = get_credentials()
-    r = s.post(brain_api_url + "/authentication")
+    # Retry authentication POST on transport-level connection errors. SSL EOF
+    # here is usually a VPN/proxy/network path reset, not a bad alpha.
+    max_auth_retries = (
+        max(1, int(max_auth_retries))
+        if max_auth_retries is not None
+        else _env_int("BRAIN_AUTH_MAX_RETRIES", 8)
+    )
+    auth_backoff_base = (
+        max(1.0, float(auth_backoff_base))
+        if auth_backoff_base is not None
+        else _env_float("BRAIN_AUTH_BACKOFF_BASE", 2.0, minimum=1.0)
+    )
+    auth_max_delay = (
+        max(1.0, float(auth_max_delay))
+        if auth_max_delay is not None
+        else _env_float("BRAIN_AUTH_MAX_DELAY", 60.0, minimum=1.0)
+    )
+    auth_timeout = (
+        max(1.0, float(auth_timeout))
+        if auth_timeout is not None
+        else _env_float("BRAIN_AUTH_TIMEOUT_SECONDS", 30.0, minimum=1.0)
+    )
+
+    last_error = ""
+    auth_url = brain_api_url + "/authentication"
+    for attempt in range(max_auth_retries):
+        s = SingleSession()
+        s.auth = get_credentials()
+        try:
+            r = s.post(auth_url, timeout=auth_timeout)
+            break
+        except _CONNECTION_ERROR_TYPES as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < max_auth_retries - 1:
+                delay = min(auth_backoff_base ** attempt, auth_max_delay)
+                logger.warning(
+                    "Connection error on POST %s (attempt %d/%d), "
+                    "retrying in %.1fs: %s",
+                    auth_url, attempt + 1, max_auth_retries, delay, last_error,
+                )
+                SingleSession.reset_instance()
+                time.sleep(delay)
+                continue
+            logger.error(
+                "Connection error on POST %s after %d attempts: %s. "
+                "This is a transport-level failure; check VPN/TUN/proxy routing "
+                "and retry instead of treating the simulation payload as invalid.",
+                auth_url, max_auth_retries, last_error,
+            )
+            raise
+
     logger.debug(f"New session created (ID: {id(s)}) with authentication response: {r.status_code}, {r.json()}")
     if r.status_code == requests.status_codes.codes.unauthorized:
         if r.headers["WWW-Authenticate"] == "persona":
@@ -325,7 +407,9 @@ def check_session_and_relogin(s: SingleSession) -> SingleSession:
 _CONNECTION_ERROR_TYPES = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
+    requests.exceptions.SSLError,
     urllib3.exceptions.ProtocolError,
+    urllib3.exceptions.SSLError,
     http.client.RemoteDisconnected,
 )
 
@@ -1605,5 +1689,4 @@ def submit_alpha(s: SingleSession, alpha_id: str) -> bool:
         else:
             break
     return result.status_code == 200
-
 
