@@ -58,6 +58,9 @@ class RunConfig:
     enhance_prompt_version: str = "enhance-v1"
     decision_prompt_version: str = "decision-v1"
     prompt_experiment: str = ""
+    adaptive_sim_policy: bool = False
+    min_concurrency: int = 1
+    max_platform_slots: int = 80
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +89,9 @@ class RunConfig:
             "enhance_prompt_version": self.enhance_prompt_version,
             "decision_prompt_version": self.decision_prompt_version,
             "prompt_experiment": self.prompt_experiment,
+            "adaptive_sim_policy": self.adaptive_sim_policy,
+            "min_concurrency": self.min_concurrency,
+            "max_platform_slots": self.max_platform_slots,
         }
 
 

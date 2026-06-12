@@ -250,7 +250,9 @@ Defaults are intentionally conservative to reduce BRAIN rate limits:
 | Non-GLB | 8 | 10 | 80 |
 | GLB | 4 | 4 | 16 |
 
-Override with `--concurrency` and `--batch-size`. Real batchSim runs also use a runtime-wide lease file at `.brain_runtime/simulation_leases.json` so multiple worker or retry processes share the same platform budget and never exceed 80 active simulation slots (`8 * 10`). If another process is already using part of the budget, the next batch is automatically trimmed to the remaining slots or waits when all slots are full. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish. During long platform waits, the simulator refreshes BRAIN authentication every 15 minutes and keeps polling; this is a defensive health check, not a failed-alpha signal. Startup authentication also retries transient transport failures such as DNS misses, timeouts, and SSL EOF resets; tune with `BRAIN_AUTH_MAX_RETRIES`, `BRAIN_AUTH_MAX_DELAY`, `BRAIN_AUTH_TIMEOUT_SECONDS`, or the batchSim flags `--auth-retries`, `--auth-max-delay`, and `--auth-timeout`.
+Override with `--concurrency` and `--batch-size`. Real batchSim runs also use a runtime-wide lease file at `.brain_runtime/simulation_leases.json` so multiple worker or retry processes share the same platform budget and never exceed 80 active simulation slots (`8 * 10`). Leases include a heartbeat and batch metadata; long-running BRAIN waits keep refreshing `last_seen_at`, so active workers are not pruned as stale just because the platform queue is slow. If another process is already using part of the budget, the next batch is automatically trimmed to the remaining slots or waits when all slots are full. Batch polling waits up to 30 minutes for parent batches to spawn children and up to 60 minutes for children to finish. During long platform waits, the simulator refreshes BRAIN authentication every 15 minutes and keeps polling; this is a defensive health check, not a failed-alpha signal. Startup authentication also retries transient transport failures such as DNS misses, timeouts, and SSL EOF resets; tune with `BRAIN_AUTH_MAX_RETRIES`, `BRAIN_AUTH_MAX_DELAY`, `BRAIN_AUTH_TIMEOUT_SECONDS`, or the batchSim flags `--auth-retries`, `--auth-max-delay`, and `--auth-timeout`. Batch diversity filtering still records repeated common operators and weak structural theme coverage, but keeps a small soft minimum so a low-diversity generated batch does not starve the simulation queue.
+
+Each real batch writes a `batch_simulation_summary` artifact and updates `.brain_runtime/simulation_platform_state.json` with recent pressure signals such as rate limits, `Retry-After`, `TIMEOUT`, `BATCH_SPAWN_FAILED`, success rate, and effective batch policy. `status` includes `simulation.policy`, `simulation.lease`, `simulation.backpressure`, and `simulation.heartbeat` so stuck-run triage can distinguish normal BRAIN waiting from stale local task state.
 
 ### Retry Failed Simulations
 
@@ -264,6 +266,7 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime retry-sim \
 ```
 
 Use `--dry-run` to write `alpha_list_retryable.json` without submitting.
+Pass `--adaptive-sim-policy` only when you explicitly want retry simulation to use the runtime pressure state; fixed policy remains the default for one-off retry runs.
 
 ### Worker (Non-Interactive Drain)
 
@@ -275,7 +278,9 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime worker \
   --refill-on-empty
 ```
 
-Each batch is capped to `batch_size * concurrency` candidates by default, then capped again by the shared runtime simulation lease. `--max-total-alphas` is a local cap for that worker process and is enforced against the worker's own submitted count before each batch starts; it is not a live query of BRAIN's per-account daily usage. Worker submissions are also recorded in `.brain_runtime/daily_simulation_usage.json` so multiple brain_agent workers can be summed by local date. Use `--mode once` for a single batch.
+Each batch is capped to `batch_size * concurrency` candidates by default, then capped again by the shared runtime simulation lease. Worker mode enables adaptive simulation policy by default: recent platform pressure halves effective `batch_size` and `concurrency` during a cooldown, then returns to the configured defaults after healthy batches. Use `--no-adaptive-sim-policy` to keep fixed sizing, or `--max-platform-slots N` to override the runtime-wide lease ceiling for supervised runs.
+
+Worker candidate selection uses SQLite reservations before writing the batch alpha list. This prevents two workers on the same run from submitting the same `sim_pending` / `sim_retryable` candidate concurrently; reservations expire automatically and are released after each batch. `--max-total-alphas` is a local cap for that worker process and is enforced against the worker's own submitted count before each batch starts; it is not a live query of BRAIN's per-account daily usage. Worker submissions are also recorded in `.brain_runtime/daily_simulation_usage.json` so multiple brain_agent workers can be summed by local date. Use `--mode once` for a single batch.
 
 Review the local daily submission ledger with:
 
@@ -284,7 +289,7 @@ PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime usage
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime usage --date 2026-06-03
 ```
 
-`--refill-on-empty` turns the worker into a closer approximation of a daemon queue: when no `sim_pending` or `sim_retryable` candidates remain, it runs a new `GENERATE -> INSPECT -> field_factory` refill and then keeps draining. `--max-empty-refills` defaults to 3 in drain mode; set it to `0` for unlimited refills during a supervised long run.
+`--refill-on-empty` turns the worker into a closer approximation of a daemon queue: when no `sim_pending` or `sim_retryable` candidates remain, it first tries a lightweight repair/variant optimization pass from existing simulated evidence. If that produces no pending candidates, it runs a new `GENERATE -> INSPECT -> field_factory` refill and then keeps draining. `--max-empty-refills` defaults to 3 in drain mode; set it to `0` for unlimited refills during a supervised long run.
 
 Drain mode intentionally does not run variant search or enhancement after every batch. It does run a light periodic optimization checkpoint every 500 submitted alphas by default: the worker scans simulated parents, skips parents already tagged by prior optimization passes, and enqueues repair variants only when useful candidates exist. Existing pending candidates stay in the queue; optimization variants receive higher `queue_priority`, so the next worker batch drains them before ordinary pending expressions. Set `--optimize-every-alphas 0` to disable, or tune `--optimize-max-parents` / `--optimize-max-variants`.
 
@@ -348,7 +353,7 @@ Cross-run memory tracks dataset, field family, operator pattern, factor thesis, 
 PYTHONPATH=.. python3 -m brain_agent --runtime-root .brain_runtime memory ingest --run-id <run_id>
 ```
 
-Run reports auto-ingest on `write_report`. Only simulated/promising/gate-passed samples enter the learnable evidence pool; generated-but-untested candidates are tracked separately and do not pollute success-rate denominators.
+Run reports auto-ingest on `write_report`. Only simulated/promising/gate-passed samples enter the learnable evidence pool; generated-but-untested candidates are tracked separately and do not pollute success-rate denominators. Reported `valid_rate` uses actionable candidates after raw makeSomeGem templates are converted or filtered; `raw_valid_rate` is retained to show the noisier all-candidate denominator.
 
 ### Summary
 

@@ -3,10 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import re
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..core.repository import Repository
+from ..core.platform_state import PlatformSimulationState
+from ..core.simulation_leases import SimulationLeasePool
 from ..core.task_runner import TaskRunner
 from ..core.utils import expression_fingerprint
 
@@ -46,6 +50,11 @@ def build_simulation_progress(repo: Repository, run_id: str, run_dir: Path) -> d
     if running_now <= 0 and task_running and remaining:
         running_now = min(remaining, concurrency or remaining)
     percent = round((terminal / total) * 100, 1) if total else 0.0
+    runtime_root = run_dir.parent.parent if run_dir.parent.name == "runs" else run_dir.parent
+    heartbeat = _heartbeat_summary(latest_task, output_csv, task_running)
+    platform = PlatformSimulationState(runtime_root).snapshot()
+    lease = SimulationLeasePool(runtime_root).snapshot()
+    policy = _latest_policy(repo, run_id)
 
     return {
         "task_id": latest_task.get("task_id") if latest_task else "",
@@ -64,6 +73,10 @@ def build_simulation_progress(repo: Repository, run_id: str, run_dir: Path) -> d
         "output_csv": str(output_csv) if output_csv else "",
         "alpha_json": str(alpha_json) if alpha_json else "",
         "latest_wait": _latest_wait_line(latest_task) if latest_task else "",
+        "heartbeat": heartbeat,
+        "lease": lease,
+        "backpressure": platform.get("backpressure") or {},
+        "policy": policy,
     }
 
 
@@ -90,6 +103,10 @@ def render_simulation_progress(progress: dict[str, Any]) -> str:
     latest_wait = str(progress.get("latest_wait") or "")
     if latest_wait:
         parts.append(f"wait='{latest_wait}'")
+    heartbeat = progress.get("heartbeat") if isinstance(progress.get("heartbeat"), dict) else {}
+    detail = str(heartbeat.get("detail") or "")
+    if detail:
+        parts.append(f"health={detail}")
     return " | ".join(parts)
 
 
@@ -138,6 +155,73 @@ def _task_int_arg(task: dict[str, Any] | None, flag: str) -> int:
             except Exception:
                 return 0
     return 0
+
+
+def _heartbeat_summary(task: dict[str, Any] | None, output_csv: Path | None, task_running: bool) -> dict[str, Any]:
+    if not task:
+        return {}
+    last = str(task.get("last_heartbeat_at") or task.get("updated_at") or "")
+    age = _age_seconds(last)
+    csv_age = _mtime_age_seconds(output_csv)
+    latest_wait = _latest_wait_line(task)
+    stale = task_running and age is not None and age > 120
+    if task_running and latest_wait:
+        detail = "brain_wait"
+    elif task_running and csv_age is not None and csv_age < 120:
+        detail = "csv_active"
+    elif stale:
+        detail = "heartbeat_stale"
+    elif task_running:
+        detail = "running"
+    else:
+        detail = "pid_exited"
+    return {
+        "last_heartbeat_at": last,
+        "age_seconds": age,
+        "stale": bool(stale),
+        "csv_age_seconds": csv_age,
+        "detail": detail,
+    }
+
+
+def _latest_policy(repo: Repository, run_id: str) -> dict[str, Any]:
+    rows = [
+        row
+        for row in repo.list_rows("artifacts", run_id)
+        if row.get("kind") == "batch_simulation_summary"
+    ]
+    if not rows:
+        return {}
+    path = Path(str(rows[-1].get("path") or ""))
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {
+        "requested": payload.get("requested_policy") or {},
+        "effective": payload.get("effective_policy") or {},
+        "summary_path": str(path),
+    }
+
+
+def _age_seconds(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        return max(0, int(time.time() - datetime.fromisoformat(value).timestamp()))
+    except ValueError:
+        return None
+
+
+def _mtime_age_seconds(path: Path | None) -> int | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        return max(0, int(time.time() - path.stat().st_mtime))
+    except OSError:
+        return None
 
 
 def _latest_artifact_path(repo: Repository, run_id: str, kind: str) -> Path | None:

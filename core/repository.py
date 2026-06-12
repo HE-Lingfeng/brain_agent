@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   stdout_path TEXT,
   stderr_path TEXT,
   retry_count INTEGER DEFAULT 0,
+  last_heartbeat_at TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -121,6 +123,17 @@ CREATE TABLE IF NOT EXISTS candidate_tags (
   created_at TEXT NOT NULL,
   UNIQUE(run_id, candidate_id, tag, source)
 );
+CREATE TABLE IF NOT EXISTS candidate_reservations (
+  reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  candidate_id INTEGER NOT NULL,
+  owner TEXT NOT NULL,
+  purpose TEXT DEFAULT 'simulation',
+  reserved_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  metadata_json TEXT DEFAULT '{}',
+  UNIQUE(run_id, candidate_id)
+);
 """
 
 
@@ -154,8 +167,11 @@ class Repository:
         self._ensure_column("gate_checks", "incomplete_checks", "TEXT DEFAULT ''")
         self._ensure_column("gate_checks", "error", "TEXT DEFAULT ''")
         self._ensure_column("gate_checks", "two_year_check", "TEXT DEFAULT ''")
+        self._ensure_column("tasks", "last_heartbeat_at", "TEXT DEFAULT ''")
         self._ensure_column("candidate_tags", "source", "TEXT DEFAULT ''")
         self._ensure_column("candidate_tags", "metadata_json", "TEXT DEFAULT '{}'")
+        self._ensure_column("candidate_reservations", "purpose", "TEXT DEFAULT 'simulation'")
+        self._ensure_column("candidate_reservations", "metadata_json", "TEXT DEFAULT '{}'")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
@@ -223,14 +239,24 @@ class Repository:
               status=excluded.status,
               stdout_path=excluded.stdout_path,
               stderr_path=excluded.stderr_path,
+              last_heartbeat_at=excluded.updated_at,
               updated_at=excluded.updated_at
             """,
             (task_id, run_id, adapter, pid, status, str(stdout_path), str(stderr_path), ts, ts),
         )
+        self.conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE task_id = ?", (ts, task_id))
         self.conn.commit()
 
     def update_task_status(self, task_id: str, status: str) -> None:
         self.conn.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", (status, now_iso(), task_id))
+        self.conn.commit()
+
+    def heartbeat_task(self, task_id: str) -> None:
+        ts = now_iso()
+        self.conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ?, updated_at = ? WHERE task_id = ?",
+            (ts, ts, task_id),
+        )
         self.conn.commit()
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
@@ -466,6 +492,104 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def prune_expired_candidate_reservations(self) -> int:
+        cur = self.conn.execute("DELETE FROM candidate_reservations WHERE expires_at <= ?", (now_iso(),))
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def claim_candidates(
+        self,
+        run_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        owner: str,
+        limit: int,
+        ttl_seconds: int = 6 * 60 * 60,
+        purpose: str = "simulation",
+        metadata: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Atomically reserve already-ranked candidates for a worker batch."""
+
+        if limit <= 0 or not candidates:
+            return []
+        now = datetime.now(timezone.utc)
+        ts = now.isoformat()
+        expires_at = (now + timedelta(seconds=max(60, int(ttl_seconds)))).isoformat()
+        ordered: list[tuple[int, dict[str, Any]]] = []
+        for row in candidates:
+            candidate_id = int(row.get("candidate_id") or 0)
+            if candidate_id:
+                ordered.append((candidate_id, row))
+        selected_ids: list[int] = []
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute("DELETE FROM candidate_reservations WHERE expires_at <= ?", (ts,))
+            for candidate_id, _row in ordered:
+                if len(selected_ids) >= limit:
+                    break
+                current = self.conn.execute(
+                    "SELECT status FROM candidates WHERE run_id = ? AND candidate_id = ?",
+                    (run_id, candidate_id),
+                ).fetchone()
+                if current is None or str(current["status"]) not in {"sim_pending", "sim_retryable"}:
+                    continue
+                reserved = self.conn.execute(
+                    "SELECT 1 FROM candidate_reservations WHERE run_id = ? AND candidate_id = ? LIMIT 1",
+                    (run_id, candidate_id),
+                ).fetchone()
+                if reserved:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO candidate_reservations(
+                      run_id, candidate_id, owner, purpose, reserved_at, expires_at, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        candidate_id,
+                        owner,
+                        purpose,
+                        ts,
+                        expires_at,
+                        json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+                selected_ids.append(candidate_id)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        by_id = {candidate_id: row for candidate_id, row in ordered}
+        return [by_id[candidate_id] for candidate_id in selected_ids]
+
+    def release_candidate_reservations(
+        self,
+        run_id: str,
+        *,
+        candidate_ids: Iterable[int] | None = None,
+        owner: str | None = None,
+    ) -> int:
+        clauses = ["run_id = ?"]
+        params: list[Any] = [run_id]
+        ids = [int(candidate_id) for candidate_id in (candidate_ids or []) if int(candidate_id or 0)]
+        if ids:
+            clauses.append("candidate_id IN (" + ",".join("?" for _ in ids) + ")")
+            params.extend(ids)
+        if owner:
+            clauses.append("owner = ?")
+            params.append(owner)
+        cur = self.conn.execute("DELETE FROM candidate_reservations WHERE " + " AND ".join(clauses), params)
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    def list_candidate_reservations(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM candidate_reservations WHERE run_id = ? ORDER BY reservation_id",
+            (run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_sim_results_by_candidate(self, run_id: str) -> dict[int, dict[str, Any]]:
         rows = self.conn.execute(
             """
@@ -483,7 +607,17 @@ class Repository:
         return result
 
     def list_rows(self, table: str, run_id: str) -> list[dict[str, Any]]:
-        if table not in {"runs", "tasks", "artifacts", "candidates", "sim_results", "gate_checks", "decisions", "candidate_tags"}:
+        if table not in {
+            "runs",
+            "tasks",
+            "artifacts",
+            "candidates",
+            "sim_results",
+            "gate_checks",
+            "decisions",
+            "candidate_tags",
+            "candidate_reservations",
+        }:
             raise ValueError(f"Unsupported table: {table}")
         if table == "runs":
             rows = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchall()

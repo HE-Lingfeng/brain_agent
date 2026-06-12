@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -22,8 +23,9 @@ from ..analysis.scoring import score_candidate, score_candidates
 from ..analysis.selection import classify_candidate
 from ..core.simulation_leases import SimulationLeasePool
 from ..core.task_runner import TaskRunner
+from ..core.platform_state import PlatformSimulationState
 from .thesis import build_factor_thesis, load_idea_context, thesis_lineage_from_row
-from ..core.utils import expression_fingerprint, file_sha256, read_json, write_json
+from ..core.utils import expression_fingerprint, file_sha256, now_iso, read_json, write_json
 from .variant_search import build_variant_search, variant_lineage_from_row
 
 
@@ -67,6 +69,7 @@ _ENHANCE_DEFAULT_MAX_DATAFIELDS = 4
 _GROUPING_SYMBOLS = {"country", "exchange", "industry", "market", "sector", "subindustry"}
 _BATCH_DIVERSITY_MIN_STRUCTURAL_THEMES = 4
 _BATCH_DIVERSITY_MAX_COMMON_OPERATOR_REPEATS = 2
+_BATCH_DIVERSITY_MIN_ACCEPTED_ROWS = 5
 _COMMON_BATCH_OPERATORS = {"rank", "zscore", "ts_mean", "ts_sum", "ts_std_dev", "winsorize", "scale", "trade_when"}
 _STRUCTURAL_OPERATOR_THEMES = {
     "conditional_holding": {"trade_when", "keep", "if_else", "nan_mask"},
@@ -152,7 +155,14 @@ class SkillAdapter:
         self.repo.add_artifact(self.run_id, kind, path, digest, stage)
         return {"kind": kind, "path": str(path), "sha256": digest, "source_stage": stage}
 
-    def run_command(self, adapter: str, cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[str, int]:
+    def run_command(
+        self,
+        adapter: str,
+        cmd: list[str],
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        on_heartbeat: Any | None = None,
+    ) -> tuple[str, int]:
         runner = TaskRunner(self.run_dir / "tasks")
         def _record_running(handle):
             self.repo.create_task(
@@ -164,6 +174,11 @@ class SkillAdapter:
                 stdout_path=handle.stdout_path,
                 stderr_path=handle.stderr_path,
             )
+
+        def _heartbeat(handle):
+            self.repo.heartbeat_task(handle.task_id)
+            if on_heartbeat:
+                on_heartbeat(handle)
 
         last_progress_line = {"text": ""}
 
@@ -183,6 +198,7 @@ class SkillAdapter:
             env=env,
             on_start=_record_running,
             on_progress=_print_progress if adapter == "batchSim" else None,
+            on_heartbeat=_heartbeat,
             progress_interval_seconds=30,
         )
         status = "completed" if returncode == 0 else "failed"
@@ -751,9 +767,18 @@ class BatchSimAdapter(SkillAdapter):
         alpha_dest = alpha_dest.resolve()
         output_csv = (self.artifacts_dir / "03_simulate" / "simulation_status.csv").resolve()
         runtime_root = self.run_dir.parent.parent if self.run_dir.parent.name == "runs" else self.run_dir.parent
-        lease_pool = SimulationLeasePool(runtime_root)
+        lease_pool = SimulationLeasePool(runtime_root, max_slots=int(config.max_platform_slots or 80))
         requested_slots = min(alpha_count, max(1, int(config.batch_size) * int(config.concurrency)))
-        lease = lease_pool.acquire(run_id=self.run_id, requested_slots=requested_slots, log_prefix="[batchSim]")
+        lease = lease_pool.acquire(
+            run_id=self.run_id,
+            requested_slots=requested_slots,
+            metadata={
+                "alpha_count": alpha_count,
+                "batch_size": int(config.batch_size),
+                "concurrency": int(config.concurrency),
+            },
+            log_prefix="[batchSim]",
+        )
         if lease.slots < alpha_count:
             deferred = alpha_count - lease.slots
             alpha_dest = _limited_alpha_list(alpha_dest, lease.slots).resolve()
@@ -766,6 +791,10 @@ class BatchSimAdapter(SkillAdapter):
             )
         else:
             print(f"[batchSim] acquired simulation lease slots={lease.slots} active={lease.active_slots}/{lease.max_slots}")
+        submitted_alpha_count = _alpha_list_count(alpha_dest)
+        effective_batch_size = max(1, min(int(config.batch_size), submitted_alpha_count))
+        effective_concurrency = max(1, min(int(config.concurrency), math.ceil(submitted_alpha_count / effective_batch_size)))
+        task_id = ""
         try:
             cmd = [
                 sys.executable,
@@ -777,24 +806,73 @@ class BatchSimAdapter(SkillAdapter):
                 "--output-csv",
                 str(output_csv),
                 "--batch-size",
-                str(config.batch_size),
+                str(effective_batch_size),
                 "--concurrency",
-                str(config.concurrency),
+                str(effective_concurrency),
                 "--stale-healthcheck-minutes",
                 "15",
             ]
-            _, returncode = self.run_command(self.name, cmd, skill_root, env=env)
+            task_id, returncode = self.run_command(
+                self.name,
+                cmd,
+                skill_root,
+                env=env,
+                on_heartbeat=lambda _handle: lease_pool.heartbeat(
+                    lease,
+                    metadata={
+                        "task_id": _handle.task_id,
+                        "submitted_alpha_count": submitted_alpha_count,
+                        "effective_batch_size": effective_batch_size,
+                        "effective_concurrency": effective_concurrency,
+                    },
+                ),
+            )
         finally:
             lease_pool.release(lease)
         if returncode != 0 and not output_csv.exists():
+            summary = _batch_simulation_summary(
+                self.run_id,
+                task_id,
+                self.run_dir,
+                output_csv,
+                submitted_alpha_count=submitted_alpha_count,
+                returncode=returncode,
+                requested_batch_size=int(config.batch_size),
+                requested_concurrency=int(config.concurrency),
+                effective_batch_size=effective_batch_size,
+                effective_concurrency=effective_concurrency,
+                lease_slots=lease.slots,
+                lease_active_slots=lease.active_slots,
+                lease_max_slots=lease.max_slots,
+            )
+            PlatformSimulationState(runtime_root).record_batch(summary)
             return AdapterResult(status="failed", error_summary=f"batch simulation failed; CSV missing: {output_csv}")
         if not output_csv.exists():
             return AdapterResult(status="failed", error_summary=f"batch simulation CSV missing: {output_csv}")
         parsed = self.parse_simulation_status(output_csv)
+        summary = _batch_simulation_summary(
+            self.run_id,
+            task_id,
+            self.run_dir,
+            output_csv,
+            submitted_alpha_count=submitted_alpha_count,
+            returncode=returncode,
+            requested_batch_size=int(config.batch_size),
+            requested_concurrency=int(config.concurrency),
+            effective_batch_size=effective_batch_size,
+            effective_concurrency=effective_concurrency,
+            lease_slots=lease.slots,
+            lease_active_slots=lease.active_slots,
+            lease_max_slots=lease.max_slots,
+        )
+        summary_path = self.artifacts_dir / "03_simulate" / f"batch_summary_{task_id or 'foreground'}.json"
+        write_json(summary_path, summary)
+        preflight_artifacts.append(self.record_artifact("batch_simulation_summary", summary_path, "SIMULATE"))
+        PlatformSimulationState(runtime_root).record_batch(summary)
         _update_pnl_cache_from_metrics(self.run_dir, parsed.metrics_delta, env)
         parsed.artifacts = preflight_artifacts + parsed.artifacts
         parsed.metrics_delta = preflight_metrics + parsed.metrics_delta
-        parsed.candidates_delta.append({"submitted_alpha_count": _alpha_list_count(alpha_dest)})
+        parsed.candidates_delta.append({"submitted_alpha_count": submitted_alpha_count})
         return parsed
 
     def _filter_alpha_list_by_batch_diversity(self, path: Path) -> tuple[Path, list[dict[str, Any]]]:
@@ -894,12 +972,19 @@ class BatchSimAdapter(SkillAdapter):
         return AdapterResult(status="ok", artifacts=artifacts, candidates_delta=candidates_delta)
 
     def _available_datafields(self, config: RunConfig, env: dict[str, str]) -> AdapterResult:
-        cache = (
+        runtime_root = self.run_dir.parent.parent if self.run_dir.parent.name == "runs" else self.run_dir.parent
+        cache_name = _safe_cache_name(
+            f"{config.dataset}_{config.region}_delay{config.delay}_{config.universe}_{config.data_type}.json"
+        )
+        cache = runtime_root / "cache" / "datafields" / cache_name
+        legacy_cache = (
             self.artifacts_dir
             / "03_simulate"
             / "datafields"
-            / f"{config.dataset}_{config.region}_delay{config.delay}_{config.universe}_{config.data_type}.json"
+            / cache_name
         )
+        if not cache.exists() and legacy_cache.exists():
+            cache = legacy_cache
         if cache.exists():
             data = read_json(cache)
             field_ids = data.get("field_ids") if isinstance(data, dict) else []
@@ -1344,6 +1429,91 @@ def _alpha_list_count(path: Path) -> int:
     return len(rows) if isinstance(rows, list) else 0
 
 
+def _batch_simulation_summary(
+    run_id: str,
+    task_id: str,
+    run_dir: Path,
+    output_csv: Path,
+    *,
+    submitted_alpha_count: int,
+    returncode: int,
+    requested_batch_size: int,
+    requested_concurrency: int,
+    effective_batch_size: int,
+    effective_concurrency: int,
+    lease_slots: int,
+    lease_active_slots: int,
+    lease_max_slots: int,
+) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    if output_csv.exists():
+        try:
+            with output_csv.open("r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    status = str(row.get("status") or "UNKNOWN").upper()
+                    status_counts[status] = status_counts.get(status, 0) + 1
+        except OSError:
+            pass
+    completed = sum(count for status, count in status_counts.items() if status in {"COMPLETE", "COMPLETED", "SUCCESS"})
+    terminal = sum(status_counts.values())
+    timeout_count = int(status_counts.get("TIMEOUT", 0))
+    spawn_failed_count = int(status_counts.get("BATCH_SPAWN_FAILED", 0))
+    stdout_text, stderr_text = _task_log_text(run_dir, task_id)
+    log_text = stdout_text + "\n" + stderr_text
+    rate_limit_events = len(re.findall(r"rate-limited|throttled|HTTP 429|\b429\b", log_text, flags=re.IGNORECASE))
+    retry_after_events = len(re.findall(r"Retry-After|retry_after", log_text, flags=re.IGNORECASE))
+    wait_events = len(re.findall(r"\[BRAIN wait\]", log_text))
+    success_rate = round(completed / submitted_alpha_count, 4) if submitted_alpha_count else 0.0
+    return {
+        "run_id": run_id,
+        "task_id": task_id,
+        "returncode": int(returncode),
+        "submitted_count": int(submitted_alpha_count),
+        "terminal_count": terminal,
+        "completed_count": completed,
+        "success_rate": success_rate,
+        "status_counts": status_counts,
+        "timeout_count": timeout_count,
+        "spawn_failed_count": spawn_failed_count,
+        "rate_limit_events": rate_limit_events,
+        "retry_after_events": retry_after_events,
+        "wait_events": wait_events,
+        "requested_policy": {
+            "batch_size": requested_batch_size,
+            "concurrency": requested_concurrency,
+        },
+        "effective_policy": {
+            "batch_size": effective_batch_size,
+            "concurrency": effective_concurrency,
+        },
+        "lease": {
+            "slots": lease_slots,
+            "active_slots": lease_active_slots,
+            "max_slots": lease_max_slots,
+        },
+        "output_csv": str(output_csv),
+        "created_at": now_iso(),
+    }
+
+
+def _task_log_text(run_dir: Path, task_id: str) -> tuple[str, str]:
+    if not task_id:
+        return "", ""
+    task_dir = run_dir / "tasks" / task_id
+    texts = []
+    for name in ("stdout.log", "stderr.log"):
+        path = task_dir / name
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="replace")[-20000:])
+        except OSError:
+            texts.append("")
+    return texts[0], texts[1]
+
+
+def _safe_cache_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(name))
+
+
 def _enhance_complexity_budget(config: RunConfig) -> dict[str, Any]:
     return {
         "max_operators": int(config.max_operators or _ENHANCE_DEFAULT_MAX_OPERATORS),
@@ -1398,6 +1568,7 @@ def _filter_json_list_by_batch_diversity(path: Path, expression_getter: Any) -> 
         return path, None, report_path
     accepted_pairs: list[tuple[int, Any]] = []
     rejected: list[dict[str, Any]] = []
+    soft_accepted: list[dict[str, Any]] = []
     accepted_common_counts: dict[str, int] = {}
     available_themes: set[str] = set()
     analyses: list[dict[str, Any]] = []
@@ -1431,6 +1602,24 @@ def _filter_json_list_by_batch_diversity(path: Path, expression_getter: Any) -> 
             if accepted_common_counts.get(op, 0) + common_ops.count(op) > _BATCH_DIVERSITY_MAX_COMMON_OPERATOR_REPEATS
         ]
         if overused:
+            min_accept = min(_BATCH_DIVERSITY_MIN_ACCEPTED_ROWS, len(rows))
+            if len(accepted_pairs) < min_accept:
+                accepted_pairs.append((index, item))
+                accepted_indices.add(index)
+                for op in common_ops:
+                    accepted_common_counts[op] = accepted_common_counts.get(op, 0) + 1
+                soft_accepted.append(
+                    {
+                        "item": item,
+                        "expression": expression,
+                        "diversity": analyses[index],
+                        "reason": "common_operator_repeat_limit_soft_accepted",
+                        "overused_operators": overused,
+                        "max_repeats_per_batch": _BATCH_DIVERSITY_MAX_COMMON_OPERATOR_REPEATS,
+                        "min_accepted_rows": min_accept,
+                    }
+                )
+                continue
             rejected.append(
                 {
                     "item": item,
@@ -1454,7 +1643,10 @@ def _filter_json_list_by_batch_diversity(path: Path, expression_getter: Any) -> 
     report = _batch_diversity_report(analyses, sorted(accepted_themes), sorted(available_themes))
     report["accepted_count"] = len(accepted)
     report["rejected_count"] = len(rejected)
+    report["soft_accepted_count"] = len(soft_accepted)
+    report["soft_accepted_sample"] = soft_accepted[:20]
     report["accepted_common_operator_counts"] = dict(sorted(accepted_common_counts.items()))
+    report["soft_min_accepted_rows"] = min(_BATCH_DIVERSITY_MIN_ACCEPTED_ROWS, len(rows))
     if len(accepted_themes) < min(_BATCH_DIVERSITY_MIN_STRUCTURAL_THEMES, len(available_themes)):
         report["warnings"].append(
             "Accepted batch did not reach available structural theme coverage; generation should add more diverse structures."

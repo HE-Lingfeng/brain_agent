@@ -3,7 +3,9 @@ from __future__ import annotations
 import signal
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,9 +15,11 @@ from ..core.daily_usage import DailySimulationUsage
 from ..core.models import CandidateStatus, RunConfig
 from ..core.models import RunStage
 from .optimization import run_optimization_pass
+from .quota_allocator import allocate_simulation_quota
 from ..core.repository import Repository
 from ..core.runtime import RuntimePaths
 from ..core.utils import now_iso, write_json
+from ..core.platform_state import PlatformSimulationState, SimulationPolicy
 
 
 @dataclass
@@ -85,9 +89,17 @@ class SimulationWorker:
         self._inspect = InspectRawTemplateAdapter(repo, run_id, paths.run_dir)
         self._batch = BatchSimAdapter(repo, run_id, paths.run_dir)
         self._usage = DailySimulationUsage(paths.root)
+        self._platform_state = PlatformSimulationState(paths.root)
         self.stats = WorkerStats()
         self._shutdown_requested = False
         self._batch_counter = 0
+        self._worker_id = f"worker_{uuid.uuid4().hex[:10]}"
+        self._active_policy = SimulationPolicy(
+            batch_size=int(config.batch_size),
+            concurrency=int(config.concurrency),
+            mode="fixed",
+            reason="not evaluated yet",
+        )
         self._stats_dir = paths.run_dir / "worker_stats"
         self._stats_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,14 +159,25 @@ class SimulationWorker:
                     print(f"[worker] worker submission limit reached ({max_total_alphas} submitted), stopping")
                     break
 
+                effective_config, policy = self._effective_config()
+                effective_capacity = max(1, int(effective_config.batch_size) * int(effective_config.concurrency))
                 batch_limit = max_candidates_per_batch
+                if batch_limit <= 0:
+                    batch_limit = effective_capacity
+                else:
+                    batch_limit = min(batch_limit, effective_capacity)
                 if max_total_alphas is not None:
                     remaining = max(0, int(max_total_alphas) - int(self.stats.total_submitted))
                     if remaining <= 0:
                         print(f"[worker] worker submission limit reached ({max_total_alphas} submitted), stopping")
                         break
                     batch_limit = min(batch_limit, remaining) if batch_limit > 0 else remaining
-                candidates = self._find_pending_candidates(max_retries=max_retries, max_results=batch_limit)
+                candidates = self._find_pending_candidates(
+                    max_retries=max_retries,
+                    max_results=batch_limit,
+                    claim=True,
+                    policy=policy.to_dict(),
+                )
                 if not candidates:
                     if refill_on_empty and (max_empty_refills is None or empty_refills < max_empty_refills):
                         empty_refills += 1
@@ -170,7 +193,7 @@ class SimulationWorker:
                     continue
 
                 self._batch_counter += 1
-                batch_info = self._submit_one_batch(candidates)
+                batch_info = self._submit_one_batch(candidates, effective_config, policy)
                 self._update_stats(batch_info)
                 self._write_stats()
                 self._print_batch_line(batch_info)
@@ -199,19 +222,37 @@ class SimulationWorker:
         self.stats.start_time = now_iso()
         self._install_signal_handlers()
 
-        candidates = self._find_pending_candidates(max_retries=max_retries, max_results=max_candidates_per_batch)
+        effective_config, policy = self._effective_config()
+        effective_capacity = max(1, int(effective_config.batch_size) * int(effective_config.concurrency))
+        limit = max_candidates_per_batch if max_candidates_per_batch > 0 else effective_capacity
+        limit = min(limit, effective_capacity)
+        candidates = self._find_pending_candidates(
+            max_retries=max_retries,
+            max_results=limit,
+            claim=True,
+            policy=policy.to_dict(),
+        )
         if not candidates and refill_on_empty:
             refill = self._refill_pending_candidates(1)
             if refill.get("error_summary"):
                 self.stats.errors.append(str(refill["error_summary"]))
-            candidates = self._find_pending_candidates(max_retries=max_retries, max_results=max_candidates_per_batch)
+            effective_config, policy = self._effective_config()
+            effective_capacity = max(1, int(effective_config.batch_size) * int(effective_config.concurrency))
+            limit = max_candidates_per_batch if max_candidates_per_batch > 0 else effective_capacity
+            limit = min(limit, effective_capacity)
+            candidates = self._find_pending_candidates(
+                max_retries=max_retries,
+                max_results=limit,
+                claim=True,
+                policy=policy.to_dict(),
+            )
         if not candidates:
             print("[worker] no pending or retryable candidates")
             self.stats.end_time = now_iso()
             return self.stats
 
         self._batch_counter += 1
-        batch_info = self._submit_one_batch(candidates)
+        batch_info = self._submit_one_batch(candidates, effective_config, policy)
         self._update_stats(batch_info)
         self._write_stats()
         self._print_batch_line(batch_info)
@@ -227,6 +268,9 @@ class SimulationWorker:
         """Generate and inspect a new candidate batch when the simulation queue is empty."""
         before_ids = {int(row["candidate_id"]) for row in self._repo.list_rows("candidates", self._run_id)}
         before_artifact_ids = {int(row["artifact_id"]) for row in self._repo.list_rows("artifacts", self._run_id)}
+        optimized = self._refill_from_existing_repairable(before_ids)
+        if optimized.get("candidate_count", 0) > 0:
+            return optimized
         print(f"[worker] queue empty; refill #{refill_number} starting generate/inspect")
 
         self._repo.update_run_stage(self._run_id, RunStage.GENERATE.value)
@@ -291,6 +335,32 @@ class SimulationWorker:
         print(f"[worker] refill #{refill_number} added {len(new_pending)} pending candidate(s)")
         return {"candidate_count": len(new_pending)}
 
+    def _refill_from_existing_repairable(self, before_ids: set[int]) -> dict[str, Any]:
+        try:
+            payload = run_optimization_pass(
+                self._repo,
+                self._run_id,
+                self._paths.run_dir,
+                self._config,
+                max_parents=10,
+                max_variants=max(20, int(self._config.batch_size) * int(self._config.concurrency)),
+                exclude_tagged=True,
+                source_prefix="refill_optimize",
+            )
+        except Exception as exc:
+            return {"candidate_count": 0, "error_summary": f"refill optimization failed: {type(exc).__name__}: {exc}"}
+        if payload.get("status") != "ok":
+            return {"candidate_count": 0, "error_summary": str(payload.get("error_summary") or "")}
+        new_pending = [
+            row
+            for row in self._repo.list_rows("candidates", self._run_id)
+            if int(row.get("candidate_id") or 0) not in before_ids
+            and row.get("status") in {CandidateStatus.SIM_PENDING.value, CandidateStatus.SIM_RETRYABLE.value}
+        ]
+        if new_pending:
+            print(f"[worker] refill optimization added {len(new_pending)} pending candidate(s)")
+        return {"candidate_count": len(new_pending)}
+
     def _run_periodic_optimization(self, *, threshold: int, max_parents: int, max_variants: int) -> None:
         print(f"[worker] optimization checkpoint reached at {threshold} submitted; scanning repairable candidates")
         try:
@@ -325,7 +395,27 @@ class SimulationWorker:
         else:
             print(f"[worker] periodic optimization found no new variants (parents={parents})")
 
-    def _find_pending_candidates(self, max_retries: int = 3, max_results: int = 0) -> list[dict[str, Any]]:
+    def _effective_config(self) -> tuple[RunConfig, SimulationPolicy]:
+        policy = self._platform_state.recommend_policy(
+            batch_size=int(self._config.batch_size),
+            concurrency=int(self._config.concurrency),
+            min_concurrency=int(self._config.min_concurrency or 1),
+            enabled=bool(self._config.adaptive_sim_policy),
+        )
+        self._active_policy = policy
+        if policy.batch_size == self._config.batch_size and policy.concurrency == self._config.concurrency:
+            return self._config, policy
+        return replace(self._config, batch_size=policy.batch_size, concurrency=policy.concurrency), policy
+
+    def _find_pending_candidates(
+        self,
+        max_retries: int = 3,
+        max_results: int = 0,
+        *,
+        claim: bool = False,
+        policy: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._repo.prune_expired_candidate_reservations()
         rows = self._repo.find_candidates_by_status(
             self._run_id,
             [CandidateStatus.SIM_PENDING.value, CandidateStatus.SIM_RETRYABLE.value],
@@ -358,18 +448,65 @@ class SimulationWorker:
             reverse=True,
         )
         if max_results > 0 and len(active) > max_results:
-            skipped = len(active) - max_results
+            active = self._allocate_candidate_batch(active, max_results)
+            skipped = len(rows) - len(active)
             print(f"[worker] capping batch to {max_results} candidates ({skipped} deferred to next batch)")
-            active = active[:max_results]
+        if claim and active:
+            claimed = self._repo.claim_candidates(
+                self._run_id,
+                active,
+                owner=self._worker_id,
+                limit=max_results if max_results > 0 else len(active),
+                ttl_seconds=6 * 60 * 60,
+                metadata={"policy": policy or {}},
+            )
+            if len(claimed) < len(active):
+                print(f"[worker] reserved {len(claimed)}/{len(active)} candidate(s); others are claimed by another worker")
+            active = claimed
         return active
 
-    def _submit_one_batch(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    def _allocate_candidate_batch(self, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        if limit <= 0 or len(candidates) <= limit:
+            return candidates
+        rows = []
+        for row in candidates:
+            expression = str(row.get("expression") or "")
+            if expression:
+                rows.append({"regular": expression, "settings": {}})
+        selected_rows, _report = allocate_simulation_quota(rows, candidates, limit=limit)
+        selected_exprs = [str(row.get("regular") or "") for row in selected_rows if isinstance(row, dict)]
+        by_expr = {str(row.get("expression") or ""): row for row in candidates}
+        selected = [by_expr[expr] for expr in selected_exprs if expr in by_expr]
+        if len(selected) < limit:
+            selected_ids = {int(row.get("candidate_id") or 0) for row in selected}
+            for row in candidates:
+                if int(row.get("candidate_id") or 0) in selected_ids:
+                    continue
+                selected.append(row)
+                if len(selected) >= limit:
+                    break
+        return selected[:limit]
+
+    def _submit_one_batch(
+        self,
+        candidates: list[dict[str, Any]],
+        config: RunConfig,
+        policy: SimulationPolicy,
+    ) -> dict[str, Any]:
         t0 = time.monotonic()
         count = len(candidates)
         batch_n = self._batch_counter
         name = f"alpha_list_worker_batch{batch_n}.json"
-        alpha_list = self._inspect.write_alpha_list_for_candidates(candidates, self._config, name=name)
-        result = self._batch.run_real(alpha_list, self._config)
+        alpha_list = self._inspect.write_alpha_list_for_candidates(candidates, config, name=name)
+        candidate_ids = [int(row.get("candidate_id") or 0) for row in candidates if int(row.get("candidate_id") or 0)]
+        try:
+            result = self._batch.run_real(alpha_list, config)
+        finally:
+            self._repo.release_candidate_reservations(
+                self._run_id,
+                candidate_ids=candidate_ids,
+                owner=self._worker_id,
+            )
         elapsed = time.monotonic() - t0
         submitted_count = _submitted_alpha_count(result, fallback=count)
 
@@ -396,6 +533,7 @@ class SimulationWorker:
             "elapsed_seconds": elapsed,
             "status": result.status,
             "error_summary": result.error_summary,
+            "policy": policy.to_dict(),
         }
 
     def _update_stats(self, batch_info: dict[str, Any]) -> None:
@@ -421,7 +559,10 @@ class SimulationWorker:
 
     def _write_stats(self) -> None:
         try:
-            write_json(self._stats_dir / "worker_stats.json", self.stats.to_dict())
+            payload = self.stats.to_dict()
+            payload["current_policy"] = self._active_policy.to_dict()
+            payload["platform"] = self._platform_state.snapshot()
+            write_json(self._stats_dir / "worker_stats.json", payload)
         except OSError:
             pass
 
@@ -442,6 +583,12 @@ class SimulationWorker:
         daily = batch_info.get("daily_submitted_count")
         if daily is not None:
             parts.append(f"today(brain_agent): {int(daily)} submitted")
+        policy = batch_info.get("policy") if isinstance(batch_info.get("policy"), dict) else {}
+        if policy:
+            parts.append(
+                "policy="
+                f"{policy.get('mode')}:{policy.get('concurrency')}x{policy.get('batch_size')}"
+            )
         print(f"[worker] {' / '.join(parts)}")
 
     def _print_summary(self) -> None:

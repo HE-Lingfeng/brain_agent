@@ -122,6 +122,7 @@ class TaskRunner:
         env: dict[str, str] | None = None,
         on_start: Callable[[TaskHandle], None] | None = None,
         on_progress: Callable[[TaskHandle], None] | None = None,
+        on_heartbeat: Callable[[TaskHandle], None] | None = None,
         progress_interval_seconds: int = 30,
     ) -> tuple[TaskHandle, int]:
         task_id = f"{adapter}_{uuid.uuid4().hex[:10]}"
@@ -157,9 +158,14 @@ class TaskRunner:
             handle = TaskHandle(task_id, int(meta["pid"] or 0), task_dir, stdout_path, stderr_path)
             if on_start:
                 on_start(handle)
-            if on_progress:
+            if on_heartbeat:
+                on_heartbeat(handle)
+            if on_progress or on_heartbeat:
                 while proc.poll() is None:
-                    on_progress(handle)
+                    if on_progress:
+                        on_progress(handle)
+                    if on_heartbeat:
+                        on_heartbeat(handle)
                     try:
                         proc.wait(timeout=max(1, int(progress_interval_seconds)))
                     except subprocess.TimeoutExpired:

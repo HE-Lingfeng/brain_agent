@@ -298,6 +298,7 @@ SQLite 主要表：
 - `gate_checks`：submission/detail submit gate 检查；真实 gate 同时读取 `/alphas/{id}/check` 和 `/alphas/{id}` 的 `is.checks` 并合并，平台页面 detail check 的 FAIL 会覆盖 `/check` 中同名 PASS，避免网页已显示失败而本地误判 ready。检查名会归一化 `CONCENTRATED_WEIGHT`、`LOW_SUB_UNIVERSE_SHARPE`、`LOW_2Y_SHARPE` 等平台页面名称，并单独记录 `two_year_check`。Dedicated self/prod correlation endpoints 可能每个 alpha 等数分钟，默认跳过并保留 `self_corr_check=PENDING`、`prod_corr_check=PENDING`；submit-ready 判定以非相关性的 submission/detail checks 为准，且 `weight_check`、`subuniverse_check`、`two_year_check` 必须明确 PASS。真实 gate 会重新检查已有 `submit_ready`，完整 gate 失败会撤销旧 ready；报告的人工提交列表只展示 latest gate complete+passed 且硬检查全 PASS 的候选。
 - `decisions`：enhance 决策、输入候选和理由。
 - `candidate_tags`：人工或定期优化时写入的 durable tags，例如 `repair_low_fitness`、`repair_subuniverse`、`repair_weight_concentration`、`short_flip_candidate`。
+- `candidate_reservations`：worker 批次级候选预占表，通过 SQLite `BEGIN IMMEDIATE` 原子 claim，避免同一 run 的多个 worker 重复提交同一 candidate。reservation 有 TTL，批次完成后释放。
 
 身份口径：
 
@@ -307,14 +308,21 @@ SQLite 主要表：
 任务语义：
 
 - 长任务由 `TaskRunner` 启动并写入 run 目录。
-- `tasks --refresh` 会同步运行状态。
+- `TaskRunner` 会持续刷新 `tasks.last_heartbeat_at`；batchSim 同步刷新 simulation lease heartbeat。
+- `tasks --refresh` 会同步运行状态，并标记 `brain_wait`、`csv_active`、`heartbeat_stale`、`pid_exited` 等健康状态。
 - `tasks --cancel` 和 `tasks --retry` 基于任务元数据执行。
 - BRAIN batch simulation 长时间等待时，优先看 task logs 和 `simulation_status.csv`，不要只根据前台超时判断失败。
+- `status` 的 `simulation` JSON 包含 `policy`、`lease`、`backpressure`、`heartbeat`，用于区分平台排队、限流降档、lease 占满和本地 task heartbeat stale。
+- 真实 batchSim 每批写 `batch_simulation_summary` artifact，并更新 runtime-wide `.brain_runtime/simulation_platform_state.json`。该状态记录最近 `429` / `Retry-After` / `TIMEOUT` / `BATCH_SPAWN_FAILED` / success rate，用于 worker 自适应调整 `batch_size` 和 `concurrency`。
+- worker 默认启用 adaptive simulation policy；普通 `run` / `retry-sim` 默认固定策略，只有显式传 `--adaptive-sim-policy` 才读取平台压力状态。
 - batch simulator 在提交前会剥离 `factor_thesis`、`lineage`、`variant_params` 等内部研究元数据，只把 BRAIN simulation API 接受的顶层字段发送给平台。
 - batch parent 默认最多等待 30 分钟生成 children，child simulation 默认最多等待 60 分钟完成；高峰期 `[BRAIN wait]` 不代表失败。
 - 连续等待超过 15 分钟时，batch simulator 会写出 `[BRAIN healthcheck]` 日志、刷新 BRAIN session 并继续 polling；这是恢复动作，不会直接把 alpha 标为失败。
 - 启动登录会对 DNS、timeout、SSL EOF 等 transport failure 做指数退避重试，并在每次重试前重建 requests session，避免 VPN/TUN/代理链路短抖动让整个 batchSim 立即失败；可用 `BRAIN_AUTH_MAX_RETRIES`、`BRAIN_AUTH_MAX_DELAY`、`BRAIN_AUTH_TIMEOUT_SECONDS` 或 batchSim 的 `--auth-*` 参数调整。
 - batch parent、child 和 single simulation 的状态抓取会对临时 HTTP、JSON 解析、空响应问题做有限重试，避免一次抓取不到就写成回测失败。
+- 报告里的 `valid_rate` 使用 actionable candidates 作为分母，不把 raw `makeSomeGem/generated` 模板记录当作 validator attempt；`raw_valid_rate` 仍保留所有候选粗分母，用来观察生成/入队转化是否过低。
+- batch diversity filter 对重复 common operators 仍会写 report/rejected artifact，但每批保留一个小的 soft minimum，避免低多样性批次把 simulation queue 饿死；`soft_accepted_count` 会在 diversity report 中记录。
+- datafield availability preflight cache 提升到 runtime 级 `<runtime_root>/cache/datafields/`，按 dataset/region/delay/universe/data_type 复用，减少 refill 和多 run 的重复平台查询。
 - `TIMEOUT`、`BATCH_SPAWN_FAILED`、限流/队列类 `SUBMISSION_FAILED` 会标为 `sim_retryable`，可用 `retry-sim --run-id <run_id>` 只重跑这些平台型失败。
 
 ## 5. 已落地能力

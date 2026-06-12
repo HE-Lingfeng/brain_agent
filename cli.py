@@ -85,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     retry_sim_p.add_argument("--limit", type=int, default=None, help="Maximum retryable candidates to resimulate")
     retry_sim_p.add_argument("--batch-size", type=int, default=None)
     retry_sim_p.add_argument("--concurrency", type=int, default=None)
+    retry_sim_p.add_argument("--adaptive-sim-policy", action="store_true", help="Enable adaptive batch/concurrency policy for this retry run")
     retry_sim_p.add_argument("--dry-run", action="store_true", help="Write retry alpha_list and print summary without submitting")
 
     optimize_p = sub.add_parser("optimize-candidates")
@@ -112,6 +113,9 @@ def main(argv: list[str] | None = None) -> int:
     worker_p.add_argument("--batch-candidates-limit", type=int, default=0, help="Max candidates per batch (0 = batch_size * concurrency)")
     worker_p.add_argument("--batch-size", type=int, default=None, help="Override batch_size from run config")
     worker_p.add_argument("--concurrency", type=int, default=None, help="Override concurrency from run config")
+    worker_p.add_argument("--adaptive-sim-policy", dest="adaptive_sim_policy", action="store_true", default=True, help="Enable adaptive batch/concurrency policy (default)")
+    worker_p.add_argument("--no-adaptive-sim-policy", dest="adaptive_sim_policy", action="store_false", help="Disable adaptive batch/concurrency policy")
+    worker_p.add_argument("--max-platform-slots", type=int, default=None, help="Runtime-wide max BRAIN simulation slots for the lease pool")
     worker_p.add_argument("--refill-on-empty", action="store_true", help="Generate and inspect new candidates when the simulation queue is empty")
     worker_p.add_argument("--max-empty-refills", type=int, default=3, help="Maximum empty-queue refill attempts in drain mode; 0 means unlimited")
     worker_p.add_argument("--optimize-every-alphas", type=int, default=500, help="Run a repair-variant optimization pass after every N submitted alphas; 0 disables")
@@ -324,6 +328,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enhance-prompt-version", default="enhance-v1")
     parser.add_argument("--decision-prompt-version", default="decision-v1")
     parser.add_argument("--prompt-experiment", default="")
+    parser.add_argument("--adaptive-sim-policy", action="store_true", help="Enable adaptive batch/concurrency policy for run simulations")
 
 
 def _parse_bool(value: str | bool) -> bool:
@@ -371,6 +376,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         enhance_prompt_version=args.enhance_prompt_version,
         decision_prompt_version=args.decision_prompt_version,
         prompt_experiment=args.prompt_experiment,
+        adaptive_sim_policy=bool(args.adaptive_sim_policy),
     )
     run_id = args.run_id or new_run_id(config.dataset, config.region)
     paths = get_runtime_paths(run_id, args.runtime_root)
@@ -511,6 +517,8 @@ def cmd_retry_sim(args: argparse.Namespace) -> int:
                 batch_size=args.batch_size if args.batch_size is not None else config.batch_size,
                 concurrency=args.concurrency if args.concurrency is not None else config.concurrency,
             )
+        if args.adaptive_sim_policy:
+            config = replace(config, adaptive_sim_policy=True)
         candidates = [
             row
             for row in repo.list_rows("candidates", args.run_id)
@@ -595,7 +603,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
             config = replace(config, concurrency=args.concurrency)
         elif config.concurrency != slot_policy["concurrency"]:
             config = replace(config, concurrency=slot_policy["concurrency"])
-        config = replace(config, max_sim_alphas=None)
+        config = replace(
+            config,
+            max_sim_alphas=None,
+            adaptive_sim_policy=bool(args.adaptive_sim_policy),
+            max_platform_slots=int(args.max_platform_slots) if args.max_platform_slots is not None else int(config.max_platform_slots or 80),
+        )
 
         limit = int(args.batch_candidates_limit)
         if limit <= 0:
@@ -1016,6 +1029,7 @@ def cmd_tasks(args: argparse.Namespace) -> int:
                 if status != row.get("status"):
                     repo.update_task_status(str(row["task_id"]), status)
                     row["status"] = status
+                row["health"] = _task_health(row)
         if any(str(row.get("adapter") or "") == "batchSim" for row in rows):
             print(render_simulation_progress(build_simulation_progress(repo, args.run_id, paths.run_dir)))
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -1065,6 +1079,76 @@ def _retry_task(repo: Repository, run_id: str, paths, task: dict) -> dict:
         "stdout_path": str(handle.stdout_path),
         "stderr_path": str(handle.stderr_path),
     }
+
+
+def _task_health(task: dict) -> dict[str, object]:
+    from datetime import datetime
+    import time
+
+    running = TaskRunner.infer_status(task.get("pid"), str(task.get("status") or "")) == "running"
+    last = str(task.get("last_heartbeat_at") or task.get("updated_at") or "")
+    age = None
+    if last:
+        try:
+            age = max(0, int(time.time() - datetime.fromisoformat(last).timestamp()))
+        except ValueError:
+            age = None
+    stdout_path = Path(str(task.get("stdout_path") or ""))
+    stderr_path = Path(str(task.get("stderr_path") or ""))
+    log_tail = ""
+    for path in (stdout_path, stderr_path):
+        try:
+            log_tail += "\n" + path.read_text(encoding="utf-8", errors="replace")[-8000:]
+        except OSError:
+            pass
+    output_csv = _task_meta_arg_path(task, "--output-csv")
+    if running and "[BRAIN wait]" in log_tail:
+        detail = "brain_wait"
+    elif running and output_csv is not None and _path_recent(output_csv, 120):
+        detail = "csv_active"
+    elif running and _path_recent(stdout_path.parent / "meta.json", 120):
+        detail = "running"
+    elif running and age is not None and age > 120:
+        detail = "heartbeat_stale"
+    elif running:
+        detail = "running"
+    else:
+        detail = "pid_exited"
+    return {
+        "detail": detail,
+        "last_heartbeat_at": last,
+        "age_seconds": age,
+        "stale": bool(running and age is not None and age > 120),
+    }
+
+
+def _path_recent(path: Path, seconds: int) -> bool:
+    import time
+
+    try:
+        return time.time() - path.stat().st_mtime <= seconds
+    except OSError:
+        return False
+
+
+def _task_meta_arg_path(task: dict, flag: str) -> Path | None:
+    stdout_path = Path(str(task.get("stdout_path") or ""))
+    meta_path = stdout_path.parent / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    cmd = meta.get("cmd") or meta.get("command") or []
+    if not isinstance(cmd, list):
+        return None
+    for idx, token in enumerate(cmd[:-1]):
+        if str(token) == flag:
+            path = Path(str(cmd[idx + 1]))
+            cwd = Path(str(meta.get("cwd") or "."))
+            return path if path.is_absolute() else (cwd / path).resolve()
+    return None
 
 
 def _credential_env_for_retry() -> dict[str, str]:

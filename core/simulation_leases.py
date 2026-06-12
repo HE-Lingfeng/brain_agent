@@ -46,6 +46,7 @@ class SimulationLeasePool:
         *,
         run_id: str,
         requested_slots: int,
+        metadata: dict[str, Any] | None = None,
         wait_seconds: int = 30,
         shutdown_requested: Any | None = None,
         log_prefix: str = "[sim-lease]",
@@ -59,13 +60,16 @@ class SimulationLeasePool:
                 if available > 0:
                     slots = min(requested, available)
                     lease_id = uuid.uuid4().hex
+                    ts = now_iso()
                     state.setdefault("leases", []).append(
                         {
                             "lease_id": lease_id,
                             "run_id": run_id,
                             "pid": os.getpid(),
                             "slots": slots,
-                            "created_at": now_iso(),
+                            "created_at": ts,
+                            "last_seen_at": ts,
+                            "metadata": metadata or {},
                         }
                     )
                     self._write_state(state)
@@ -80,6 +84,22 @@ class SimulationLeasePool:
                 raise RuntimeError("shutdown requested while waiting for simulation slots")
             print(f"{log_prefix} platform slots full ({self.max_slots}/{self.max_slots}); waiting {wait_seconds}s")
             time.sleep(max(1, int(wait_seconds)))
+
+    def heartbeat(self, lease: SimulationLease, *, metadata: dict[str, Any] | None = None) -> None:
+        with self._locked_state() as state:
+            changed = False
+            for item in state.get("leases") or []:
+                if item.get("lease_id") != lease.lease_id:
+                    continue
+                item["last_seen_at"] = now_iso()
+                if metadata:
+                    existing = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                    existing.update(metadata)
+                    item["metadata"] = existing
+                changed = True
+                break
+            if changed:
+                self._write_state(state)
 
     def release(self, lease: SimulationLease) -> None:
         with self._locked_state() as state:
@@ -132,10 +152,10 @@ class SimulationLeasePool:
         kept: list[dict[str, Any]] = []
         for item in state.get("leases") or []:
             pid = int(item.get("pid") or 0)
-            created_at = self._timestamp(item.get("created_at"))
+            seen_at = self._timestamp(item.get("last_seen_at") or item.get("created_at"))
             if pid and not self._pid_alive(pid):
                 continue
-            if created_at and now - created_at > self.stale_seconds:
+            if seen_at and now - seen_at > self.stale_seconds:
                 continue
             kept.append(item)
         state["leases"] = kept

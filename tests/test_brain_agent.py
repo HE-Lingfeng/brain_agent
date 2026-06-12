@@ -41,9 +41,10 @@ from brain_agent.core.repository import Repository
 from brain_agent.core.runtime import ensure_runtime, get_runtime_paths
 from brain_agent.analysis.scoring import score_candidate
 from brain_agent.core.simulation_leases import SimulationLeasePool
+from brain_agent.core.platform_state import PlatformSimulationState
 from brain_agent.pipeline.optimizers import SecondOrderOptimizer
 from brain_agent.analysis.selection import classify_candidate
-from brain_agent.core.utils import expression_fingerprint, write_json
+from brain_agent.core.utils import expression_fingerprint, now_iso, write_json
 from brain_agent.pipeline.variant_search import (
     _eligible_for_second_order,
     _neutralization_decay_cross_sweep,
@@ -677,13 +678,13 @@ class BrainAgentTests(unittest.TestCase):
         filtered = json.loads(Path(filtered_path).read_text(encoding="utf-8"))
         expressions = [item["regular"] for item in filtered]
         rank_uses = sum(expr.count("rank(") for expr in expressions)
-        self.assertLessEqual(rank_uses, 2)
+        self.assertGreater(rank_uses, 2)
         self.assertIn("group_vector_neut(rank(volume), sector)", expressions)
         self.assertTrue(any(a["kind"] == "alpha_list_diversity_report" for a in artifacts))
-        self.assertTrue(any(a["kind"] == "alpha_list_diversity_rejected" for a in artifacts))
-        rejected_artifact = next(a for a in artifacts if a["kind"] == "alpha_list_diversity_rejected")
-        rejected = json.loads(Path(rejected_artifact["path"]).read_text(encoding="utf-8"))
-        self.assertTrue(any(item["reason"] == "common_operator_repeat_limit" for item in rejected))
+        report_artifact = next(a for a in artifacts if a["kind"] == "alpha_list_diversity_report")
+        report = json.loads(Path(report_artifact["path"]).read_text(encoding="utf-8"))
+        self.assertGreater(report["soft_accepted_count"], 0)
+        self.assertEqual(report["soft_min_accepted_rows"], min(5, len(rows)))
 
     def test_batch_simulator_strips_internal_metadata_from_submission_payload(self) -> None:
         module = _load_batch_simulator_module()
@@ -902,6 +903,24 @@ class BrainAgentTests(unittest.TestCase):
         self.assertEqual("PRECHECK_FAILED", sim["status"])
         self.assertIn("incompatible", sim["error"])
         self.assertIn("EVENT", sim["error"])
+
+    def test_available_datafields_uses_runtime_cache(self) -> None:
+        cache = self.paths.root / "cache" / "datafields" / "analyst7_USA_delay1_TOP3000_MATRIX.json"
+        write_json(
+            cache,
+            {
+                "field_ids": ["cached_field"],
+                "field_types": {"cached_field": "MATRIX"},
+                "fields": [{"id": "cached_field", "type": "MATRIX"}],
+            },
+        )
+        adapter = BatchSimAdapter(self.repo, "test_run", self.paths.run_dir)
+
+        result = adapter._available_datafields(self.config, {})
+
+        self.assertEqual("ok", result.status)
+        self.assertEqual(["cached_field"], result.candidates_delta[0]["field_ids"])
+        self.assertEqual("datafields_preflight", result.artifacts[0]["kind"])
 
     def test_write_alpha_list_honors_custom_simulation_settings(self) -> None:
         config = RunConfig(
@@ -2176,6 +2195,43 @@ class BrainAgentTests(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertEqual(task_id, payload[0]["task_id"])
 
+    def test_tasks_cli_refresh_marks_stale_heartbeat(self) -> None:
+        self.repo.create_task(
+            "test_run",
+            "stale_task",
+            "batchSim",
+            pid=os.getpid(),
+            status="running",
+            stdout_path=self.root / "stdout.log",
+            stderr_path=self.root / "stderr.log",
+        )
+        old = "2000-01-01T00:00:00+00:00"
+        self.repo.conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ?, updated_at = ? WHERE task_id = ?",
+            (old, old, "stale_task"),
+        )
+        self.repo.conn.commit()
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = main(
+                [
+                    "--runtime-root",
+                    str(self.root),
+                    "tasks",
+                    "--run-id",
+                    "test_run",
+                    "--task-id",
+                    "stale_task",
+                    "--refresh",
+                ]
+            )
+
+        self.assertEqual(0, code)
+        text = out.getvalue()
+        start = text.rfind("\n[")
+        payload = json.loads(text[start + 1 if start >= 0 else text.index("[") :])
+        self.assertEqual("heartbeat_stale", payload[0]["health"]["detail"])
+
     def test_tasks_cli_cancel_missing_process_marks_exited(self) -> None:
         self.repo.create_task(
             "test_run",
@@ -2396,6 +2452,68 @@ class BrainAgentTests(unittest.TestCase):
         pool.release(first)
         self.assertEqual(0, pool.snapshot()["active_slots"])
 
+    def test_simulation_lease_heartbeat_prevents_stale_prune(self) -> None:
+        pool = SimulationLeasePool(self.paths.root, max_slots=80, stale_seconds=60)
+        lease = pool.acquire(run_id="test_run", requested_slots=10)
+        state = json.loads(pool.path.read_text(encoding="utf-8"))
+        state["leases"][0]["created_at"] = "2000-01-01T00:00:00+00:00"
+        state["leases"][0]["last_seen_at"] = now_iso()
+        pool.path.write_text(json.dumps(state), encoding="utf-8")
+
+        self.assertEqual(10, pool.snapshot()["active_slots"])
+
+        state = json.loads(pool.path.read_text(encoding="utf-8"))
+        state["leases"][0]["last_seen_at"] = "2000-01-01T00:00:00+00:00"
+        pool.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(0, pool.snapshot()["active_slots"])
+
+    def test_candidate_reservations_claim_without_duplicates(self) -> None:
+        candidates = []
+        for idx in range(3):
+            expr = f"rank(analyst7_claim_{idx})"
+            cid = self.repo.upsert_candidate(
+                "test_run",
+                expr,
+                expression_fingerprint(expr),
+                status=CandidateStatus.SIM_PENDING.value,
+                source="unit",
+            )
+            candidates.append({"candidate_id": cid, "expression": expr})
+
+        first = self.repo.claim_candidates("test_run", candidates, owner="worker_a", limit=2)
+        second = self.repo.claim_candidates("test_run", candidates, owner="worker_b", limit=2)
+
+        self.assertEqual(2, len(first))
+        self.assertEqual(1, len(second))
+        self.assertEqual(
+            3,
+            len({int(row["candidate_id"]) for row in first + second}),
+        )
+        self.repo.release_candidate_reservations("test_run", owner="worker_a")
+        self.assertEqual(1, len(self.repo.list_candidate_reservations("test_run")))
+
+    def test_platform_state_adaptive_policy_reduces_on_pressure(self) -> None:
+        state = PlatformSimulationState(self.paths.root)
+        state.record_batch(
+            {
+                "run_id": "test_run",
+                "submitted_count": 20,
+                "completed_count": 2,
+                "success_rate": 0.1,
+                "rate_limit_events": 2,
+                "retry_after_events": 2,
+                "timeout_count": 1,
+                "spawn_failed_count": 0,
+            }
+        )
+
+        policy = state.recommend_policy(batch_size=10, concurrency=8, min_concurrency=2, enabled=True)
+
+        self.assertEqual("adaptive", policy.mode)
+        self.assertLess(policy.batch_size, 10)
+        self.assertLess(policy.concurrency, 8)
+        self.assertGreaterEqual(policy.concurrency, 2)
+
     def test_batch_sim_adapter_respects_existing_global_simulation_lease(self) -> None:
         for idx in range(20):
             expr = f"rank(analyst7_lease_{idx})"
@@ -2415,7 +2533,7 @@ class BrainAgentTests(unittest.TestCase):
             name="lease_test_alpha_list.json",
         )
 
-        def fake_run_command(adapter, name, cmd, cwd, env=None):
+        def fake_run_command(adapter, name, cmd, cwd, env=None, on_heartbeat=None):
             alpha_path = Path(cmd[cmd.index("--alpha-json") + 1])
             output_path = Path(cmd[cmd.index("--output-csv") + 1])
             rows = json.loads(alpha_path.read_text(encoding="utf-8"))

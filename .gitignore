@@ -22,6 +22,7 @@
 !/core/credentials.py
 !/core/daily_usage.py
 !/core/models.py
+!/core/platform_state.py
 !/core/progress.py
 !/core/repository.py
 !/core/runtime.py

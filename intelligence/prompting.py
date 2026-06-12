@@ -124,6 +124,11 @@ def summarize_run_prompt_metrics(repo: Repository, run_id: str) -> dict[str, Any
     sim_results = repo.list_rows("sim_results", run_id)
     gates = repo.list_rows("gate_checks", run_id)
     counts = summarize_counts(candidates)
+    raw_generated = _raw_generated_candidates(candidates)
+    raw_generated_ids = {int(c.get("candidate_id") or 0) for c in raw_generated}
+    actionable_candidates = [
+        c for c in candidates if int(c.get("candidate_id") or 0) not in raw_generated_ids
+    ]
     complete = [r for r in sim_results if str(r.get("status") or "").upper() in {"COMPLETE", "COMPLETED", "SUCCESS"}]
     passed_gates = [g for g in gates if int(g.get("passed") or 0) == 1]
     prompt_versions = {
@@ -141,10 +146,14 @@ def summarize_run_prompt_metrics(repo: Repository, run_id: str) -> dict[str, Any
         "settings_signature": settings_signature(comparable_settings),
         "prompt_versions": prompt_versions,
         "candidate_count": len(candidates),
+        "raw_generated_count": len(raw_generated),
+        "actionable_candidate_count": len(actionable_candidates),
         "sim_result_count": len(sim_results),
         "sim_success_count": len(complete),
         "sim_success_rate": _rate(len(complete), len(sim_results)),
-        "valid_rate": _rate(len(sim_results), len(candidates)),
+        "valid_rate": _rate(len(sim_results), len(actionable_candidates)),
+        "raw_valid_rate": _rate(len(sim_results), len(candidates)),
+        "queue_conversion_rate": _rate(len(actionable_candidates), len(candidates)),
         "promising_count": counts.get("promising", 0),
         "needs_enhance_count": counts.get("needs_enhance", 0),
         "submit_ready_count": counts.get("submit_ready", 0),
@@ -304,6 +313,16 @@ def write_prompt_compare_report(report: dict[str, Any], output: Path) -> Path:
 
 def _rate(num: int, den: int) -> float:
     return round(num / den, 4) if den else 0.0
+
+
+def _raw_generated_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Raw makeSomeGem templates are upstream material, not validator attempts."""
+    return [
+        candidate
+        for candidate in candidates
+        if str(candidate.get("status") or "") == "generated"
+        and str(candidate.get("source") or "") == "makeSomeGem"
+    ]
 
 
 def _avg(rows: list[dict[str, Any]], key: str) -> float | None:

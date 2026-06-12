@@ -56,6 +56,8 @@ def write_report(repo: Repository, run_id: str, run_dir: Path) -> tuple[Path, Pa
     ]
     tag_counts = summarize_failure_tags(result["sim_results"])
     research_summary = _research_summary(result, ready, tag_counts)
+    funnel_metrics = _candidate_funnel_metrics(candidates, result["sim_results"])
+    diversity_summary = _diversity_filter_summary(result["artifacts"])
     variant_comparisons = _variant_comparisons(candidates, result["sim_results"])
     gate_incomplete_counts = _gate_incomplete_counts(result["gate_checks"])
 
@@ -97,11 +99,37 @@ def write_report(repo: Repository, run_id: str, run_dir: Path) -> tuple[Path, Pa
     for status, count in sorted(result["counts"].items()):
         lines.append(f"- {status}: {count}")
     lines.append("")
+    lines.append("## Inspection And Queue Funnel")
+    lines.append(f"- raw makeSomeGem generated: {funnel_metrics['raw_generated_count']}")
+    lines.append(f"- actionable candidates: {funnel_metrics['actionable_candidate_count']}")
+    lines.append(f"- simulation results: {funnel_metrics['sim_result_count']}")
+    lines.append(f"- queue_conversion_rate: {funnel_metrics['queue_conversion_rate']}")
+    lines.append(f"- actionable_valid_rate: {funnel_metrics['actionable_valid_rate']}")
+    lines.append(f"- raw_valid_rate: {funnel_metrics['raw_valid_rate']}")
+    if diversity_summary["report_count"]:
+        lines.append(f"- diversity reports: {diversity_summary['report_count']}")
+        lines.append(f"- diversity accepted/rejected: {diversity_summary['accepted_count']} / {diversity_summary['rejected_count']}")
+        if diversity_summary["soft_accepted_count"]:
+            lines.append(f"- diversity soft-accepted despite repeat limits: {diversity_summary['soft_accepted_count']}")
+        if diversity_summary["top_rejection_reasons"]:
+            rendered = ", ".join(f"{reason}={count}" for reason, count in diversity_summary["top_rejection_reasons"])
+            lines.append(f"- top diversity rejection reasons: {rendered}")
+        if diversity_summary["warnings"]:
+            lines.append("- diversity warnings:")
+            for warning, count in diversity_summary["warnings"]:
+                lines.append(f"  - {warning} ({count})")
+    else:
+        lines.append("- diversity reports: 0")
+    lines.append("")
     lines.append("## Prompt Metrics")
     prompt_metrics = result.get("prompt_metrics") if isinstance(result.get("prompt_metrics"), dict) else {}
     if prompt_metrics:
         lines.append(f"- experiment_score: {prompt_metrics.get('score')}")
         lines.append(f"- valid_rate: {prompt_metrics.get('valid_rate')}")
+        lines.append(f"- raw_valid_rate: {prompt_metrics.get('raw_valid_rate')}")
+        lines.append(f"- queue_conversion_rate: {prompt_metrics.get('queue_conversion_rate')}")
+        lines.append(f"- actionable_candidate_count: {prompt_metrics.get('actionable_candidate_count')}")
+        lines.append(f"- raw_generated_count: {prompt_metrics.get('raw_generated_count')}")
         lines.append(f"- sim_success_rate: {prompt_metrics.get('sim_success_rate')}")
         lines.append(f"- promising_rate: {prompt_metrics.get('promising_rate')}")
         lines.append(f"- submit_ready_rate: {prompt_metrics.get('submit_ready_rate')}")
@@ -480,6 +508,78 @@ def _check_result_rank(value: Any) -> int:
     return 2
 
 
+def _candidate_funnel_metrics(candidates: list[dict[str, Any]], sim_results: list[dict[str, Any]]) -> dict[str, Any]:
+    raw_generated = [
+        candidate
+        for candidate in candidates
+        if str(candidate.get("status") or "") == "generated"
+        and str(candidate.get("source") or "") == "makeSomeGem"
+    ]
+    raw_ids = {int(candidate.get("candidate_id") or 0) for candidate in raw_generated}
+    actionable = [
+        candidate
+        for candidate in candidates
+        if int(candidate.get("candidate_id") or 0) not in raw_ids
+    ]
+    return {
+        "raw_generated_count": len(raw_generated),
+        "actionable_candidate_count": len(actionable),
+        "sim_result_count": len(sim_results),
+        "queue_conversion_rate": _pct(len(actionable), len(candidates)),
+        "actionable_valid_rate": _pct(len(sim_results), len(actionable)),
+        "raw_valid_rate": _pct(len(sim_results), len(candidates)),
+    }
+
+
+def _diversity_filter_summary(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    report_count = 0
+    accepted_count = 0
+    rejected_count = 0
+    soft_accepted_count = 0
+    rejection_reasons: Counter[str] = Counter()
+    warnings: Counter[str] = Counter()
+    for artifact in artifacts:
+        kind = str(artifact.get("kind") or "")
+        path = Path(str(artifact.get("path") or ""))
+        if not path.exists():
+            continue
+        if kind.endswith("diversity_report"):
+            payload = _read_json_file(path)
+            if isinstance(payload, dict):
+                report_count += 1
+                accepted_count += int(payload.get("accepted_count") or 0)
+                rejected_count += int(payload.get("rejected_count") or 0)
+                soft_accepted_count += int(payload.get("soft_accepted_count") or 0)
+                for warning in payload.get("warnings") or []:
+                    if warning:
+                        warnings[str(warning)] += 1
+        elif kind.endswith("diversity_rejected"):
+            payload = _read_json_file(path)
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict):
+                        rejection_reasons[str(item.get("reason") or "unknown")] += 1
+    return {
+        "report_count": report_count,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "soft_accepted_count": soft_accepted_count,
+        "top_rejection_reasons": rejection_reasons.most_common(8),
+        "warnings": warnings.most_common(8),
+    }
+
+
+def _read_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _pct(num: int, den: int) -> float:
+    return round(num / den, 4) if den else 0.0
+
+
 def _research_summary(result: dict[str, Any], ready: list[dict[str, Any]], tag_counts: dict[str, int]) -> list[str]:
     metrics = result.get("prompt_metrics") if isinstance(result.get("prompt_metrics"), dict) else {}
     counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
@@ -489,7 +589,7 @@ def _research_summary(result: dict[str, Any], ready: list[dict[str, Any]], tag_c
         f"Outcome: stage={result['run'].get('stage')}, stop_reason={result['run'].get('stop_reason') or ''}",
         f"Candidate funnel: total={len(candidates)}, promising={counts.get('promising', 0)}, needs_enhance={counts.get('needs_enhance', 0)}, submit_ready={len(ready)}",
         f"Prompt experiment score: {metrics.get('score') if metrics else 'n/a'}",
-        f"Simulation quality: valid_rate={metrics.get('valid_rate') if metrics else 'n/a'}, sim_success_rate={metrics.get('sim_success_rate') if metrics else 'n/a'}, avg_sharpe={metrics.get('avg_sharpe') if metrics else 'n/a'}, avg_fitness={metrics.get('avg_fitness') if metrics else 'n/a'}",
+        f"Simulation quality: actionable_valid_rate={metrics.get('valid_rate') if metrics else 'n/a'}, raw_valid_rate={metrics.get('raw_valid_rate') if metrics else 'n/a'}, sim_success_rate={metrics.get('sim_success_rate') if metrics else 'n/a'}, avg_sharpe={metrics.get('avg_sharpe') if metrics else 'n/a'}, avg_fitness={metrics.get('avg_fitness') if metrics else 'n/a'}",
         f"Top failure patterns: {top_tags}",
     ]
 
